@@ -1,0 +1,845 @@
+diff --git a/box.go b/box.go
+index 92cd1ec..03834d3 100644
+--- a/box.go
++++ b/box.go
+@@ -63,6 +63,8 @@ type Box struct {
+ 	httpClientService   adapter.LifecycleService
+ 	internalService     []adapter.LifecycleService
+ 	done                chan struct{}
++	reloader            *configReloader
++	reuseLogFactory     bool
+ }
+ 
+ type Options struct {
+@@ -70,6 +72,7 @@ type Options struct {
+ 	Context                    context.Context
+ 	PlatformLogWriter          log.PlatformWriter
+ 	NetworkNamespaceHolderArgs []string
++	reuseLogFactory            bool
+ }
+ 
+ func Context(
+@@ -175,14 +178,17 @@ func New(options Options) (*Box, error) {
+ 	if platformInterface != nil {
+ 		defaultLogWriter = io.Discard
+ 	}
+-	logFactory, err := log.New(log.Options{
+-		Context:        ctx,
+-		Options:        common.PtrValueOrDefault(options.Log),
+-		Observable:     needClashAPI && experimentalOptions.ClashAPI.ExternalController != "",
+-		DefaultWriter:  defaultLogWriter,
+-		BaseTime:       createdAt,
+-		PlatformWriter: options.PlatformLogWriter,
+-	})
++	logFactory := service.FromContext[log.Factory](ctx)
++	if !options.reuseLogFactory {
++		logFactory, err = log.New(log.Options{
++			Context:        ctx,
++			Options:        common.PtrValueOrDefault(options.Log),
++			Observable:     needClashAPI && experimentalOptions.ClashAPI.ExternalController != "",
++			DefaultWriter:  defaultLogWriter,
++			BaseTime:       createdAt,
++			PlatformWriter: options.PlatformLogWriter,
++		})
++	}
+ 	if err != nil {
+ 		return nil, E.Cause(err, "create log factory")
+ 	}
+@@ -244,8 +250,20 @@ func New(options Options) (*Box, error) {
+ 	if err != nil {
+ 		return nil, E.Cause(err, "initialize router")
+ 	}
++	var reloader *configReloader
++	var inboundRouter adapter.Router = router
++	var outboundView adapter.OutboundManager = outboundManager
++	if options.HotReload {
++		reloader = newConfigReloader(ctx, options.Options, router)
++		inboundRouter = &reloadRouter{Router: router, reload: reloader}
++		reloader.inboundRouter = inboundRouter
++		outboundView = &reloadOutboundView{OutboundManager: outboundManager, reload: reloader}
++		service.MustRegister[adapter.ConfigReloadManager](ctx, reloader)
++		service.MustRegister[adapter.Router](ctx, inboundRouter)
++		service.MustRegister[adapter.OutboundManager](ctx, outboundView)
++	}
+ 	if needClashAPI || needAPIService || options.PlatformLogWriter != nil {
+-		trafficManager := trafficcontrol.NewManager(outboundManager)
++		trafficManager := trafficcontrol.NewManager(outboundView)
+ 		service.MustRegisterPtr(ctx, trafficManager)
+ 		router.AppendTracker(trafficManager)
+ 		internalServices = append(internalServices, trafficManager)
+@@ -320,7 +338,7 @@ func New(options Options) (*Box, error) {
+ 		}
+ 		err = inboundManager.Create(
+ 			ctx,
+-			router,
++			inboundRouter,
+ 			logFactory.NewLogger(F.ToString("inbound/", inboundOptions.Type, "[", tag, "]")),
+ 			tag,
+ 			inboundOptions.Type,
+@@ -467,7 +485,7 @@ func New(options Options) (*Box, error) {
+ 		timeService.TimeService = ntpService
+ 		internalServices = append(internalServices, adapter.NewLifecycleService(ntpService, "ntp service"))
+ 	}
+-	return &Box{
++	instance := &Box{
+ 		ctx:                 ctx,
+ 		network:             networkManager,
+ 		endpoint:            endpointManager,
+@@ -486,7 +504,13 @@ func New(options Options) (*Box, error) {
+ 		logger:              logFactory.Logger(),
+ 		internalService:     internalServices,
+ 		done:                make(chan struct{}),
+-	}, nil
++		reloader:            reloader,
++		reuseLogFactory:     options.reuseLogFactory,
++	}
++	if reloader != nil {
++		reloader.current.box = instance
++	}
++	return instance, nil
+ }
+ 
+ func (s *Box) PreStart() error {
+@@ -530,7 +554,10 @@ func (s *Box) Start() error {
+ func (s *Box) preStart() error {
+ 	monitor := taskmonitor.New(s.logger, C.StartTimeout)
+ 	monitor.Start("start logger")
+-	err := s.logFactory.Start()
++	var err error
++	if !s.reuseLogFactory {
++		err = s.logFactory.Start()
++	}
+ 	monitor.Finish()
+ 	if err != nil {
+ 		return E.Cause(err, "start logger")
+@@ -610,6 +637,9 @@ func (s *Box) Close() error {
+ 	default:
+ 		close(s.done)
+ 	}
++	if s.reloader != nil {
++		s.reloader.close()
++	}
+ 	var err error
+ 	if s.debugHTTPServer != nil {
+ 		err = E.Append(err, s.debugHTTPServer.Close(), func(err error) error {
+@@ -654,9 +684,11 @@ func (s *Box) Close() error {
+ 		done()
+ 	}
+ 	done := adapter.LogElapsed(s.logger, "close logger")
+-	err = E.Append(err, s.logFactory.Close(), func(err error) error {
+-		return E.Cause(err, "close logger")
+-	})
++	if !s.reuseLogFactory {
++		err = E.Append(err, s.logFactory.Close(), func(err error) error {
++			return E.Cause(err, "close logger")
++		})
++	}
+ 	done()
+ 	return err
+ }
+diff --git a/dns/transport/fakeip/fakeip.go b/dns/transport/fakeip/fakeip.go
+index 75db1cf..741f889 100644
+--- a/dns/transport/fakeip/fakeip.go
++++ b/dns/transport/fakeip/fakeip.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/sagernet/sing-box/option"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/logger"
++	"github.com/sagernet/sing/service"
+ 
+ 	mDNS "github.com/miekg/dns"
+ )
+@@ -35,7 +36,10 @@ func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, opt
+ 	if !inet4Range.IsValid() && !inet6Range.IsValid() {
+ 		return nil, E.New("at least one of inet4_range or inet6_range must be set")
+ 	}
+-	store := NewStore(ctx, logger, inet4Range, inet6Range)
++	store := service.FromContext[adapter.FakeIPStore](ctx)
++	if store == nil {
++		store = NewStore(ctx, logger, inet4Range, inet6Range)
++	}
+ 	return &Transport{
+ 		TransportAdapter: dns.NewTransportAdapter(C.DNSTypeFakeIP, tag, nil),
+ 		logger:           logger,
+diff --git a/experimental/clashapi/configs.go b/experimental/clashapi/configs.go
+index 35a1d4b..7903c45 100644
+--- a/experimental/clashapi/configs.go
++++ b/experimental/clashapi/configs.go
+@@ -1,9 +1,13 @@
+ package clashapi
+ 
+ import (
++	"errors"
++	"io"
+ 	"net/http"
+ 
++	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing/service"
+ 
+ 	"github.com/go-chi/chi/v5"
+ 	"github.com/go-chi/render"
+@@ -14,6 +18,8 @@ func configRouter(server *Server, logFactory log.Factory) http.Handler {
+ 	r.Get("/", getConfigs(server, logFactory))
+ 	r.Put("/", updateConfigs)
+ 	r.Patch("/", patchConfigs(server))
++	r.Get("/hot-reload", hotReloadCapabilities(server))
++	r.Put("/hot-reload", hotReloadConfigs(server))
+ 	return r
+ }
+ 
+@@ -69,3 +75,39 @@ func patchConfigs(server *Server) func(w http.ResponseWriter, r *http.Request) {
+ func updateConfigs(w http.ResponseWriter, r *http.Request) {
+ 	render.NoContent(w, r)
+ }
++
++func hotReloadCapabilities(server *Server) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		if service.FromContext[adapter.ConfigReloadManager](server.ctx) == nil {
++			render.Status(r, http.StatusNotImplemented)
++			render.JSON(w, r, render.M{"error": "hot_reload_disabled"})
++			return
++		}
++		render.JSON(w, r, render.M{"hot_reload_version": 1, "preserve_connections": true})
++	}
++}
++
++func hotReloadConfigs(server *Server) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		manager := service.FromContext[adapter.ConfigReloadManager](server.ctx)
++		if manager == nil {
++			render.Status(r, http.StatusNotImplemented)
++			render.JSON(w, r, render.M{"error": "hot_reload_disabled"})
++			return
++		}
++		content, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
++		if err == nil {
++			err = manager.ReloadConfig(r.Context(), content)
++		}
++		if err != nil {
++			status, code := http.StatusBadRequest, "invalid_config"
++			if errors.Is(err, adapter.ErrHotReloadUnsupported) {
++				status, code = http.StatusConflict, "requires_restart"
++			}
++			render.Status(r, status)
++			render.JSON(w, r, render.M{"error": code})
++			return
++		}
++		render.JSON(w, r, render.M{"hot_reload_version": 1, "applied": true})
++	}
++}
+diff --git a/option/options.go b/option/options.go
+index b2116d3..3623f83 100644
+--- a/option/options.go
++++ b/option/options.go
+@@ -15,6 +15,7 @@ type _Options struct {
+ 	RawMessage           json.RawMessage       `json:"-"`
+ 	CommentsSet          *json.CommentSet      `json:"-"`
+ 	Schema               string                `json:"$schema,omitempty" examples:"https://sing-box.sagernet.org/schema.json"`
++	HotReload            bool                  `json:"hot_reload,omitempty"`
+ 	Log                  *LogOptions           `json:"log,omitempty"`
+ 	DNS                  *DNSOptions           `json:"dns,omitempty"`
+ 	NTP                  *NTPOptions           `json:"ntp,omitempty"`
+diff --git a/adapter/config_reload.go b/adapter/config_reload.go
+new file mode 100644
+index 0000000..8c18f2c
+--- /dev/null
++++ b/adapter/config_reload.go
+@@ -0,0 +1,13 @@
++package adapter
++
++import (
++	"context"
++	"errors"
++)
++
++var ErrHotReloadUnsupported = errors.New("hot reload requires core restart")
++
++// ConfigReloadManager 只切换新流量的运行实例，不关闭已有连接或监听器。
++type ConfigReloadManager interface {
++	ReloadConfig(ctx context.Context, content []byte) error
++}
+diff --git a/adapter/shared_fakeip.go b/adapter/shared_fakeip.go
+new file mode 100644
+index 0000000..d007a00
+--- /dev/null
++++ b/adapter/shared_fakeip.go
+@@ -0,0 +1,9 @@
++package adapter
++
++// BorrowedFakeIPStore 共享初始实例的地址映射与分配游标，但不接管其生命周期。
++type BorrowedFakeIPStore struct {
++	FakeIPStore
++}
++
++func (s BorrowedFakeIPStore) Start() error { return nil }
++func (s BorrowedFakeIPStore) Close() error { return nil }
+diff --git a/cmd/sing-box/cmd_hot_reload.go b/cmd/sing-box/cmd_hot_reload.go
+new file mode 100644
+index 0000000..07f7566
+--- /dev/null
++++ b/cmd/sing-box/cmd_hot_reload.go
+@@ -0,0 +1,17 @@
++package main
++
++import (
++	"fmt"
++
++	"github.com/spf13/cobra"
++)
++
++func init() {
++	mainCommand.AddCommand(&cobra.Command{
++		Use:   "hot-reload-capabilities",
++		Short: "Print native hot reload protocol version",
++		Run: func(cmd *cobra.Command, args []string) {
++			fmt.Println(`{"hot_reload_version":1}`)
++		},
++	})
++}
+diff --git a/config_reload.go b/config_reload.go
+new file mode 100644
+index 0000000..72d1462
+--- /dev/null
++++ b/config_reload.go
+@@ -0,0 +1,438 @@
++package box
++
++import (
++	"context"
++	"errors"
++	"net"
++	"os"
++	"reflect"
++	"sync"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/trafficcontrol"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	F "github.com/sagernet/sing/common/format"
++	"github.com/sagernet/sing/common/json"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++)
++
++var ErrHotReloadUnsupported = adapter.ErrHotReloadUnsupported
++
++const maxReloadGenerations = 8
++
++type reloadGeneration struct {
++	box     *Box
++	router  adapter.Router
++	options option.Options
++	cancel  context.CancelFunc
++	active  int
++	retired bool
++}
++
++type configReloader struct {
++	mu          sync.Mutex
++	applyMu     sync.Mutex
++	closeWait   sync.WaitGroup
++	closing     int
++	ctx         context.Context
++	current     *reloadGeneration
++	initial     *reloadGeneration
++	generations []*reloadGeneration
++	closed      bool
++	// 初始实例创建入站时使用的路由（转发到当前运行实例），热重载新建的入站沿用它。
++	inboundRouter adapter.Router
++}
++
++func newConfigReloader(ctx context.Context, options option.Options, router adapter.Router) *configReloader {
++	initial := &reloadGeneration{router: router, options: options}
++	return &configReloader{ctx: ctx, current: initial, initial: initial, generations: []*reloadGeneration{initial}}
++}
++
++func normalizedOptions(options option.Options) option.Options {
++	options.RawMessage, options.CommentsSet = nil, nil
++	return options
++}
++
++func reloadStaticOptions(options option.Options) option.Options {
++	options = normalizedOptions(options)
++	// 入站由初始实例持有，变化的入站在切换时单独关闭重建（见 inboundChanges）。
++	options.Outbounds, options.DNS, options.Inbounds = nil, nil, nil
++	if options.Route != nil {
++		route := *options.Route
++		route.Rules, route.RuleSet, route.Final = nil, nil, ""
++		options.Route = &route
++	}
++	return options
++}
++
++func reloadSupported(options option.Options) bool {
++	if len(options.Endpoints) > 0 || len(options.Services) > 0 || len(options.NetworkNamespaces) > 0 {
++		return false
++	}
++	for _, inbound := range options.Inbounds {
++		if inbound.Type == "tun" {
++			return false
++		}
++	}
++	for _, outbound := range options.Outbounds {
++		if outbound.Type == "wireguard" || outbound.Type == "loopback" || outbound.Type == "tun" {
++			return false
++		}
++	}
++	return true
++}
++
++type inboundChange struct {
++	tag      string
++	previous *option.Inbound
++	next     *option.Inbound
++}
++
++// 按 tag 比较入站：新增、删除与内容变化的入站。没有 tag 的入站由启动顺序决定名字，无法安全对应，返回 false。
++func inboundChanges(previous, next []option.Inbound) ([]inboundChange, bool) {
++	old := make(map[string]option.Inbound, len(previous))
++	for _, inbound := range previous {
++		if inbound.Tag == "" {
++			return nil, reflect.DeepEqual(previous, next)
++		}
++		old[inbound.Tag] = inbound
++	}
++	var changes []inboundChange
++	seen := make(map[string]bool, len(next))
++	for i := range next {
++		inbound := next[i]
++		if inbound.Tag == "" || seen[inbound.Tag] {
++			return nil, false
++		}
++		seen[inbound.Tag] = true
++		if before, loaded := old[inbound.Tag]; !loaded {
++			changes = append(changes, inboundChange{tag: inbound.Tag, next: &next[i]})
++		} else if !reflect.DeepEqual(before, inbound) {
++			changes = append(changes, inboundChange{tag: inbound.Tag, previous: &before, next: &next[i]})
++		}
++	}
++	for i := range previous {
++		if !seen[previous[i].Tag] {
++			changes = append(changes, inboundChange{tag: previous[i].Tag, previous: &previous[i]})
++		}
++	}
++	return changes, true
++}
++
++// 在初始实例的入站管理器上应用入站变化：先关闭旧入站（同端口才能重新绑定），再创建新入站。
++// 新入站经 inboundRouter 交给当前运行实例。任一步失败按相反顺序恢复原入站并返回错误。
++func (r *configReloader) applyInbounds(changes []inboundChange) (func(), error) {
++	initial := r.initial.box
++	if initial == nil || r.inboundRouter == nil {
++		return nil, ErrHotReloadUnsupported
++	}
++	manager := initial.inbound
++	create := func(inbound *option.Inbound) error {
++		logger := initial.logFactory.NewLogger(F.ToString("inbound/", inbound.Type, "[", inbound.Tag, "]"))
++		return manager.Create(r.ctx, r.inboundRouter, logger, inbound.Tag, inbound.Type, inbound.Options)
++	}
++	var undo []func()
++	rollback := func() {
++		for i := len(undo) - 1; i >= 0; i-- {
++			undo[i]()
++		}
++	}
++	// 先关闭全部要删除或替换的旧入站，再创建新入站：换 tag 但沿用端口（如重定向改为 TPROXY）时才能绑定。
++	for _, change := range changes {
++		change := change
++		if change.previous != nil {
++			if err := manager.Remove(change.tag); err != nil && !errors.Is(err, os.ErrInvalid) {
++				rollback()
++				return nil, E.Cause(err, "close inbound ", change.tag)
++			}
++			undo = append(undo, func() { _ = create(change.previous) })
++		}
++	}
++	for _, change := range changes {
++		change := change
++		if change.next != nil {
++			if err := create(change.next); err != nil {
++				rollback()
++				return nil, E.Cause(err, "create inbound ", change.tag)
++			}
++			undo = append(undo, func() { _ = manager.Remove(change.tag) })
++		}
++	}
++	return rollback, nil
++}
++
++func reloadFakeIPOptions(options option.Options) []option.DNSServerOptions {
++	var result []option.DNSServerOptions
++	if options.DNS != nil {
++		for _, server := range options.DNS.Servers {
++			if server.Type == "fakeip" {
++				result = append(result, server)
++			}
++		}
++	}
++	return result
++}
++
++func (r *configReloader) collectLocked(generation *reloadGeneration) {
++	// 初始实例仍拥有监听器、控制 API 和共享日志，不能整体关闭。
++	if !generation.retired || generation.active != 0 || generation.cancel == nil {
++		return
++	}
++	for i, candidate := range r.generations {
++		if candidate == generation {
++			r.generations = append(r.generations[:i], r.generations[i+1:]...)
++			break
++		}
++	}
++	cancel := generation.cancel
++	generation.cancel = nil
++	r.closeWait.Add(1)
++	r.closing++
++	go func() {
++		defer r.closeWait.Done()
++		cancel()
++		generation.box.Close()
++		r.mu.Lock()
++		r.closing--
++		r.mu.Unlock()
++	}()
++}
++
++func (r *configReloader) acquire() (*reloadGeneration, func()) {
++	r.mu.Lock()
++	if r.closed {
++		r.mu.Unlock()
++		return nil, func() {}
++	}
++	generation := r.current
++	generation.active++
++	r.mu.Unlock()
++	var once sync.Once
++	return generation, func() {
++		once.Do(func() {
++			r.mu.Lock()
++			generation.active--
++			r.collectLocked(generation)
++			r.mu.Unlock()
++		})
++	}
++}
++
++func (r *configReloader) ReloadConfig(requestCtx context.Context, content []byte) error {
++	r.applyMu.Lock()
++	defer r.applyMu.Unlock()
++	options, err := json.UnmarshalExtendedContext[option.Options](r.ctx, content)
++	if err != nil {
++		return E.Cause(err, "decode hot reload configuration")
++	}
++	r.mu.Lock()
++	if r.closed {
++		r.mu.Unlock()
++		return net.ErrClosed
++	}
++	previous := r.current
++	if reflect.DeepEqual(normalizedOptions(previous.options), normalizedOptions(options)) {
++		r.mu.Unlock()
++		return nil
++	}
++	changes, comparable := inboundChanges(previous.options.Inbounds, options.Inbounds)
++	if !comparable || !reloadSupported(previous.options) || !reloadSupported(options) ||
++		!reflect.DeepEqual(reloadStaticOptions(previous.options), reloadStaticOptions(options)) ||
++		!reflect.DeepEqual(reloadFakeIPOptions(previous.options), reloadFakeIPOptions(options)) ||
++		len(r.generations)+r.closing >= maxReloadGenerations {
++		r.mu.Unlock()
++		return ErrHotReloadUnsupported
++	}
++	r.mu.Unlock()
++	if err := requestCtx.Err(); err != nil {
++		return err
++	}
++	staged := options
++	staged.HotReload = false
++	staged.Inbounds, staged.Endpoints, staged.Services = nil, nil, nil
++	staged.Experimental, staged.NTP, staged.Certificate, staged.CertificateProviders = nil, nil, nil, nil
++	staged.RawMessage, staged.CommentsSet = nil, nil
++	ctx, cancel := context.WithCancel(service.ExtendContext(r.ctx))
++	if len(reloadFakeIPOptions(options)) > 0 {
++		initial := r.initial.box
++		if initial == nil || initial.dnsTransport.FakeIP() == nil {
++			cancel()
++			return ErrHotReloadUnsupported
++		}
++		service.MustRegister[adapter.FakeIPStore](ctx, adapter.BorrowedFakeIPStore{FakeIPStore: initial.dnsTransport.FakeIP().Store()})
++	}
++	stopCancellation := context.AfterFunc(requestCtx, cancel)
++	defer stopCancellation()
++	instance, err := New(Options{Options: staged, Context: ctx, reuseLogFactory: true})
++	if err != nil {
++		cancel()
++		return E.Cause(err, "prepare hot reload instance")
++	}
++	if tracker := service.PtrFromContext[trafficcontrol.Manager](r.ctx); tracker != nil {
++		instance.router.AppendTracker(tracker)
++	}
++	if err = instance.Start(); err != nil {
++		cancel()
++		return E.Cause(err, "start hot reload instance")
++	}
++	if !stopCancellation() || requestCtx.Err() != nil || ctx.Err() != nil {
++		cancel()
++		instance.Close()
++		return E.New("hot reload request canceled before commit")
++	}
++	// 入站变化在新运行实例就绪之后、切换之前应用；新入站的连接在切换前由当前实例处理，切换后由新实例处理。
++	var undoInbounds func()
++	if len(changes) > 0 {
++		undoInbounds, err = r.applyInbounds(changes)
++		if err != nil {
++			cancel()
++			instance.Close()
++			return E.Cause(err, "apply hot reload inbounds")
++		}
++	}
++	r.mu.Lock()
++	if r.closed {
++		r.mu.Unlock()
++		if undoInbounds != nil {
++			undoInbounds()
++		}
++		cancel()
++		instance.Close()
++		return net.ErrClosed
++	}
++	generation := &reloadGeneration{box: instance, router: instance.router, options: options, cancel: cancel}
++	r.generations = append(r.generations, generation)
++	r.current = generation
++	previous.retired = true
++	r.collectLocked(previous)
++	r.mu.Unlock()
++	return nil
++}
++
++func (r *configReloader) close() {
++	r.applyMu.Lock()
++	defer r.applyMu.Unlock()
++	r.mu.Lock()
++	r.closed = true
++	var targets []struct {
++		cancel context.CancelFunc
++		box    *Box
++	}
++	for _, generation := range r.generations {
++		if generation.cancel != nil {
++			targets = append(targets, struct {
++				cancel context.CancelFunc
++				box    *Box
++			}{generation.cancel, generation.box})
++			generation.cancel = nil
++		}
++	}
++	r.generations = nil
++	r.mu.Unlock()
++	for _, target := range targets {
++		target.cancel()
++		target.box.Close()
++	}
++	r.closeWait.Wait()
++}
++
++type reloadRouter struct {
++	adapter.Router
++	reload *configReloader
++}
++
++func (r *reloadRouter) RouteConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
++	generation, release := r.reload.acquire()
++	defer release()
++	if generation == nil {
++		conn.Close()
++		return net.ErrClosed
++	}
++	return generation.router.RouteConnection(ctx, conn, metadata)
++}
++
++func (r *reloadRouter) RoutePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext) error {
++	generation, release := r.reload.acquire()
++	defer release()
++	if generation == nil {
++		conn.Close()
++		return net.ErrClosed
++	}
++	return generation.router.RoutePacketConnection(ctx, conn, metadata)
++}
++
++func (r *reloadRouter) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++	generation, release := r.reload.acquire()
++	if generation == nil {
++		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
++		return
++	}
++	generation.router.RouteConnectionEx(ctx, conn, metadata, N.OnceClose(func(err error) {
++		defer release()
++		if onClose != nil {
++			onClose(err)
++		}
++	}))
++}
++
++func (r *reloadRouter) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++	generation, release := r.reload.acquire()
++	if generation == nil {
++		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
++		return
++	}
++	generation.router.RoutePacketConnectionEx(ctx, conn, metadata, N.OnceClose(func(err error) {
++		defer release()
++		if onClose != nil {
++			onClose(err)
++		}
++	}))
++}
++
++func (r *reloadRouter) HijackDNSPacket(ctx context.Context, payload []byte, writer N.PacketWriter, metadata adapter.InboundContext) {
++	generation, release := r.reload.acquire()
++	defer release()
++	if generation != nil {
++		generation.router.HijackDNSPacket(ctx, payload, writer, metadata)
++	}
++}
++
++func (r *reloadRouter) Rules() []adapter.Rule {
++	generation, release := r.reload.acquire()
++	defer release()
++	if generation == nil {
++		return nil
++	}
++	return generation.router.Rules()
++}
++
++func (r *reloadRouter) RuleSet(tag string) (adapter.RuleSet, bool) {
++	generation, release := r.reload.acquire()
++	defer release()
++	if generation == nil {
++		return nil, false
++	}
++	return generation.router.RuleSet(tag)
++}
++
++type reloadOutboundView struct {
++	adapter.OutboundManager
++	reload *configReloader
++}
++
++func (v *reloadOutboundView) current() adapter.OutboundManager {
++	v.reload.mu.Lock()
++	defer v.reload.mu.Unlock()
++	if v.reload.current.box == nil {
++		return v.OutboundManager
++	}
++	return v.reload.current.box.outbound
++}
++
++func (v *reloadOutboundView) Outbounds() []adapter.Outbound { return v.current().Outbounds() }
++func (v *reloadOutboundView) Outbound(tag string) (adapter.Outbound, bool) {
++	return v.current().Outbound(tag)
++}
++func (v *reloadOutboundView) Default() adapter.Outbound { return v.current().Default() }
+diff --git a/config_reload_test.go b/config_reload_test.go
+new file mode 100644
+index 0000000..687a6b7
+--- /dev/null
++++ b/config_reload_test.go
+@@ -0,0 +1,96 @@
++package box
++
++import (
++	"context"
++	"net"
++	"sync"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++	N "github.com/sagernet/sing/common/network"
++)
++
++type reloadTestRouter struct {
++	adapter.Router
++	closed N.CloseHandlerFunc
++}
++
++func (r *reloadTestRouter) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
++	r.closed = onClose
++}
++
++func TestHotReloadConnectionLease(t *testing.T) {
++	delegate := &reloadTestRouter{}
++	r := newConfigReloader(context.Background(), option.Options{}, delegate)
++	bridge := &reloadRouter{Router: delegate, reload: r}
++	bridge.RouteConnectionEx(context.Background(), nil, adapter.InboundContext{}, nil)
++	if r.current.active != 1 {
++		t.Fatal("连接建立后缺少运行实例引用")
++	}
++	delegate.closed(nil)
++	delegate.closed(nil)
++	if r.current.active != 0 {
++		t.Fatal("结束回调没有恰好释放一次引用")
++	}
++}
++
++func TestHotReloadLeaseConcurrent(t *testing.T) {
++	r := newConfigReloader(context.Background(), option.Options{}, &reloadTestRouter{})
++	var group sync.WaitGroup
++	for i := 0; i < 100; i++ {
++		group.Add(1)
++		go func() { defer group.Done(); _, release := r.acquire(); release(); release() }()
++	}
++	group.Wait()
++	if r.current.active != 0 {
++		t.Fatal("并发引用没有排空")
++	}
++}
++
++func TestHotReloadUnsupportedResources(t *testing.T) {
++	for _, options := range []option.Options{
++		{Inbounds: []option.Inbound{{Type: "tun"}}},
++		{Endpoints: []option.Endpoint{{Type: "wireguard"}}},
++		{Outbounds: []option.Outbound{{Type: "loopback"}}},
++	} {
++		if reloadSupported(options) {
++			t.Fatal("独占资源不能进入热重载")
++		}
++	}
++}
++
++func TestHotReloadInboundChanges(t *testing.T) {
++	socks := func(tag string, port uint16) option.Inbound {
++		return option.Inbound{Type: "socks", Tag: tag, Options: &option.SocksInboundOptions{ListenOptions: option.ListenOptions{ListenPort: port}}}
++	}
++	previous := []option.Inbound{socks("a", 1), socks("b", 2), socks("c", 3)}
++	next := []option.Inbound{socks("b", 2), socks("a", 4), socks("d", 5)}
++	changes, ok := inboundChanges(previous, next)
++	if !ok || len(changes) != 3 {
++		t.Fatalf("入站差异计算错误：%v %d", ok, len(changes))
++	}
++	kinds := map[string]string{}
++	for _, change := range changes {
++		switch {
++		case change.previous != nil && change.next != nil:
++			kinds[change.tag] = "changed"
++		case change.next != nil:
++			kinds[change.tag] = "added"
++		default:
++			kinds[change.tag] = "removed"
++		}
++	}
++	if kinds["a"] != "changed" || kinds["d"] != "added" || kinds["c"] != "removed" || kinds["b"] != "" {
++		t.Fatalf("入站差异分类错误：%v", kinds)
++	}
++	if _, ok := inboundChanges(previous, append(next, socks("", 6))); ok {
++		t.Fatal("没有 tag 的新入站不能热重载")
++	}
++	if _, ok := inboundChanges(previous, []option.Inbound{socks("a", 1), socks("a", 7)}); ok {
++		t.Fatal("tag 重复的入站不能热重载")
++	}
++	if changes, ok := inboundChanges(previous, previous); !ok || len(changes) != 0 {
++		t.Fatal("相同入站不应产生变化")
++	}
++}

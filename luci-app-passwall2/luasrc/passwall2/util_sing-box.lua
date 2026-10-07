@@ -135,7 +135,9 @@ function gen_outbound(flag, node, tag, proxy_table)
 					end
 				end
 				if run_socks_instance then
-					new_port = api.get_new_port()
+					-- 桥接端口按节点（及带标签的中继）稳定分配，重新生成的配置与运行中的一致。
+					local bridge = (tag and node_id and not tag:find(node_id)) and (tag .. "_" .. node_id) or node_id
+					new_port = api.get_new_port(nil, "nodesocks:" .. bridge .. ":" .. relay_port)
 					local config_file = string.format("nodesocks_%s_%s.json", node_id, new_port)
 					if tag and node_id and not tag:find(node_id) then
 						config_file = string.format("nodesocks_%s_%s_%s.json", tag, node_id, new_port)
@@ -1097,7 +1099,9 @@ function gen_config_server(node)
 				bind_interface = node.outbound_node_iface,
 				routing_mark = 255,
 			}
-			sys.call(string.format("mkdir -p %s && touch %s/%s", api.TMP_IFACE_PATH, api.TMP_IFACE_PATH, node.outbound_node_iface))
+			if not RELOAD then
+				sys.call(string.format("mkdir -p %s && touch %s/%s", api.TMP_IFACE_PATH, api.TMP_IFACE_PATH, node.outbound_node_iface))
+			end
 		else
 			local outbound_node_t = api.uci_get_c(node.outbound_node)
 			if node.outbound_node == "_socks" or node.outbound_node == "_http" then
@@ -1194,6 +1198,7 @@ function gen_config(var)
 	local remote_rewrite_ttl = var["remote_rewrite_ttl"] or "30"
 	local dns_cache = var["dns_cache"]
 	NO_RUN = var["no_run"]
+	RELOAD = var["reload"]
 
 	local dns_domain_rules = {}
 	local dns = {}
@@ -1202,7 +1207,8 @@ function gen_config(var)
 	local rule_set_table = {}
 	local COMMON = {}
 
-	local CACHE_TEXT_FILE = CACHE_PATH .. "/cache_" .. flag .. ".txt"
+	-- 影子启动与暂存的上次记录比较（不改动正式缓存），提交时再写回。
+	local CACHE_TEXT_FILE = (os.getenv("PW2_GEN_CACHE") or CACHE_PATH) .. "/cache_" .. flag .. ".txt"
 
 	local singbox_settings = api.uci_get_c("@global_singbox[0]") or {}
 
@@ -1502,7 +1508,7 @@ function gen_config(var)
 					local to_outbound
 					if to_node.type ~= "sing-box" then
 						local tag = to_node[".name"]
-						local new_port = api.get_new_port()
+						local new_port = api.get_new_port(nil, "tunnel:" .. flag .. ":" .. tag)
 						table.insert(inbounds, {
 							type = "direct",
 							tag = tag,
@@ -1571,7 +1577,9 @@ function gen_config(var)
 							bind_interface = node.iface,
 							routing_mark = 255,
 						}
-						sys.call(string.format("mkdir -p %s && touch %s/%s", api.TMP_IFACE_PATH, api.TMP_IFACE_PATH, node.iface))
+						if not RELOAD then
+							sys.call(string.format("mkdir -p %s && touch %s/%s", api.TMP_IFACE_PATH, api.TMP_IFACE_PATH, node.iface))
+						end
 					end
 				else
 					if tag == "default" then
@@ -2036,7 +2044,9 @@ function gen_config(var)
 		table.insert(dns.servers, remote_server)
 
 		fakedns_tag = "remote_fakeip"
-		if remote_dns_fake or inner_fakedns == "1" then
+		-- 支持原生热重载时始终声明同一 FakeIP 服务与缓存文件（未被规则引用时不分配地址），
+		-- 切换到不使用 FakeDNS 的节点后，客户端缓存的 FakeIP 仍能由共享存储还原域名。
+		if remote_dns_fake or inner_fakedns == "1" or var.reload_native == "1" then
 			table.insert(dns.servers, {
 				tag = fakedns_tag,
 				type = "fakeip",
@@ -2214,7 +2224,18 @@ function gen_config(var)
 		})
 
 		local content = flag .. node_id .. jsonc.stringify(route.rules)
-		if api.cacheFileCompareToLogic(CACHE_TEXT_FILE, content) == false then
+		local rules_changed = not RELOAD and api.cacheFileCompareToLogic(CACHE_TEXT_FILE, content) == false
+		if rules_changed and os.getenv("PW2_STAGE") then
+			-- 影子启动：分流规则变化后需要清空的直连写集合记录下来，由热重载在防火墙事务中清空。
+			local out = io.open(api.TMP_PATH .. "/flush_sets", "a")
+			if out then
+				string.gsub(direct_nftset or direct_ipset or "", '[^' .. "," .. ']+', function(w)
+					local split = api.split(w, "#")
+					out:write((#split > 3 and split[4] or w) .. "\n")
+				end)
+				out:close()
+			end
+		elseif rules_changed then
 			--clear ipset/nftset
 			if direct_ipset then
 				string.gsub(direct_ipset, '[^' .. "," .. ']+', function(w)
@@ -2296,8 +2317,18 @@ function gen_config(var)
 			tag = "direct",
 			routing_mark = 255,
 		})
+		if var.reload_api_port then
+			config.experimental = config.experimental or {}
+			config.experimental.clash_api = {
+				external_controller = "127.0.0.1:" .. var.reload_api_port,
+				secret = var.reload_api_secret
+			}
+			config.hot_reload = var.reload_native == "1" and true or nil
+		end
 		for index, value in ipairs(config.outbounds) do
-			if not value["_flag_proxy_tag"] and not value.detour and value["_id"] and value.server and value.server_port and not NO_RUN then
+			-- 热重载同样记录直连拨号的节点，执行器据此为新的“地址:端口”补充本机放行规则；节点测速等临时实例不记录。
+			if not value["_flag_proxy_tag"] and not value.detour and value["_id"] and value.server and value.server_port and (not NO_RUN or RELOAD) and
+				not os.getenv("PW2_TEMPORARY") then
 				sys.call(string.format("echo '%s' >> %s", value["_id"], api.TMP_PATH .. "/direct_node_list"))
 			end
 			if not value.detour and not value.bind_interface and value.server then
@@ -2426,6 +2457,42 @@ function gen_proto_config(var)
 		outbounds = outbounds,
 	}
 	return jsonc.stringify(config, 1)
+end
+
+-- 热重载在进程内调用 gen_config，不经过下面的脚本入口；执行器在校验前用它补齐缺失的规则集文件。
+function convert_pending_geofile()
+	if next(GEO_VAR.SITE_TAGS) or next(GEO_VAR.IP_TAGS) then
+		convert_geofile()
+	end
+end
+
+-- 规则数据（geosite/geoip）更新后重新转换本次配置用到的全部规则集：先写临时文件再改名覆盖，
+-- 运行中的 sing-box 监视到同名文件被创建后自动重载该规则集，不需要重启或新建运行实例。
+-- 不删除缓存目录中的其它文件（FakeIP 缓存库仍在使用）。
+function refresh_geofile()
+	if check_geoview() ~= 1 then
+		return true
+	end
+	local bin = api.finded_com("geoview")
+	local ok = true
+	local function refresh(file_path, prefix, tags)
+		if not next(tags) or not fs.access(file_path) then return end
+		for k in pairs(tags) do
+			local output = GEO_VAR.TO_SRS_PATH .. prefix .. "-" .. k .. ".srs"
+			local tmp = output .. ".tmp"
+			fs.unlink(tmp)
+			local code, out = api.exec_call(string.format("%q -type %q -action convert -input %q -list %q -output %q -lowmem=true",
+				bin, prefix, file_path, k, tmp))
+			if not (code == 0 and fs.access(tmp) and fs.rename(tmp, output)) then
+				fs.unlink(tmp)
+				ok = false
+				api.log(0, string.format("  - %s:%s convert to srs %s [%s]", prefix, k, "failed!", out or ""))
+			end
+		end
+	end
+	refresh(GEO_VAR.SITE_PATH, "geosite", GEO_VAR.SITE_TAGS)
+	refresh(GEO_VAR.IP_PATH, "geoip", GEO_VAR.IP_TAGS)
+	return ok
 end
 
 _G.gen_config = gen_config

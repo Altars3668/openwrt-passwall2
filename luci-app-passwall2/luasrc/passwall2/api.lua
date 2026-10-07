@@ -21,9 +21,10 @@ OPENWRT_ARCH = nil
 DISTRIB_ARCH = nil
 
 LOCK_PREFIX = "/var/lock/" .. c_config
-LOG_FILE = "/tmp/log/" .. c_config .. ".log"
-TMP_PATH = "/tmp/etc/" .. c_config
-CACHE_PATH = TMP_PATH .. "_tmp"
+-- 影子启动（热重载生成目标状态）通过环境变量把生成的文件和日志写到暂存位置；缓存目录始终是正式路径。
+LOG_FILE = os.getenv("PW2_LOG_FILE") or "/tmp/log/" .. c_config .. ".log"
+TMP_PATH = os.getenv("PW2_TMP_PATH") or "/tmp/etc/" .. c_config
+CACHE_PATH = "/tmp/etc/" .. c_config .. "_tmp"
 S_TMP_PATH = "/tmp/etc/" .. s_config
 TMP_IFACE_PATH = TMP_PATH .. "/iface"
 TMP_ACL_PATH = TMP_PATH .. "/acl"
@@ -206,10 +207,11 @@ function get_cache_var(key)
 	return val
 end
 
-function get_new_port(p)
+-- key：可选的用途键，同一用途沿用已记录的端口（见 utils.sh get_new_port）。
+function get_new_port(p, key)
 	if not p then p = "auto" end
-	local cmd_format = ". /usr/share/passwall2/utils.sh ; echo -n $(get_new_port %s tcp,udp)"
-	return tonumber(sys.exec(string.format(cmd_format, p)))
+	local cmd_format = ". /usr/share/passwall2/utils.sh ; echo -n $(get_new_port %s tcp,udp %s)"
+	return tonumber(sys.exec(string.format(cmd_format, p, key and util.shellquote(key) or "")))
 end
 
 function exec_call(cmd)

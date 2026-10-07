@@ -1,224 +1,98 @@
-# PassWall2
+# Passwall2 · 原生热重载定制版
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![OpenWrt](https://img.shields.io/badge/OpenWrt-21.02%2B-blue)](https://openwrt.org/)
-[![LuCI](https://img.shields.io/badge/LuCI-17.01%2B-green)](https://github.com/openwrt/luci)
+**简体中文** | [English](README.en.md)
 
-PassWall2 is a powerful LuCI web interface application for OpenWrt that provides advanced proxy functionality. It's a comprehensive solution for network traffic management, proxy services, and access control on OpenWrt-based routers.
+基于 [Openwrt-Passwall/openwrt-passwall2](https://github.com/Openwrt-Passwall/openwrt-passwall2) 的定制 fork，核心目标是：**把日常“保存并应用”从整套服务 stop/start，改成可校验、可回滚、按组件更新的应用流程**。
 
-## 🛠️ Installation
+上游提供 LuCI 代理管理、节点、订阅、分流、DNS 和访问控制；我的改造集中在服务生命周期、sing-box / Xray 的原生配置更新、防火墙差量提交及旧配置迁移，**不是另写一个代理核心，也不把上游协议支持算作原创功能**。
 
-### ⚠️ Pre-installation
+当前定制线基于上游 **26.10.1**。GitHub `main` 是用于公开构建的**脱敏快照**；完整开发历史保留在私有 Gitea，两端 commit SHA 不应当被要求相同。
 
-```bash
-# find it in releases,base of your router Arch
-```
-**Visit [GitHub Releases](https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/latest) to download the correct package for your system.**
+## 我的改造与特色
 
-Choose the package format based on your **router's OpenWrt package manager**:
+| 改造 | 实际作用 |
+| --- | --- |
+| **核心原生热更新** | 为匹配版本的 sing-box / Xray 提供补丁，校验并预加载新运行实例；新连接进入新配置，旧连接在旧实例中排空。 |
+| **全局节点热切换** | 同核心切换保留已有连接，原子更新分流子链；DNS 与其他实例不必跟着整套重启。 |
+| **影子启动 + 差量协调** | 用真实启动流程生成暂存目标状态，再按进程、监听器、DNS、集合、防火墙及系统派生项比较提交；未变化的组件保持不动。 |
+| **规则 / 节点 / 计划任务热刷新** | 规则集合、节点域名 / 地址和更新计划分别处理，减少因为非核心变化而重启代理与 DNS。 |
+| **nftables / iptables 支持** | nftables 使用规则事务；iptables 使用子链、restore 配方与 ipset swap，保留两者能力差异。 |
+| **校验、事务与恢复** | 配置先检查，失败尽量恢复旧配置 / 进程 / 规则；处理中断和提交后的恢复路径有明确状态记录。 |
+| **服务互斥修正** | 稳定 flock inode、关闭长驻子进程继承的锁、限时等待与排队应用，避免保存被丢弃或永久卡锁。 |
+| **旧配置兼容** | 迁移旧 ACL 来源 / 端口写法与服务端凭据结构，修复直连 DNS 推导及旧 dnsmasq 缓存布局。 |
+| **测速实例隔离** | 节点测试使用独立目录与实例标记，不把临时测速进程误当作热重载目标。 |
 
-### For OpenWrt with OPKG 
+详解：[docs/hot-reload.md](docs/hot-reload.md) · 实现：[reload.lua](luci-app-passwall2/root/usr/share/passwall2/reload.lua) / [reconcile.lua](luci-app-passwall2/luasrc/passwall2/reconcile.lua) · 核心补丁：[patches/cores](patches/cores/) · 测试：[tests](tests/)。
 
-1. **Download the IPK package** from the releases page  
-   Look for `luci-app-passwall2_{VERSION}_all.ipk` in the Assets section.  
-   > **Note:** If you need localization (Chinese/Persian), download the corresponding language package as well (e.g., `luci-i18n-passwall2-zh-cn...` or `...-fa...`).
+## “无损”具体意味着什么
 
-2. **Upload to your router** (via SCP, LuCI upload, or wget):
-   ```bash
-   # Replace {VERSION} with the actual version (e.g., 26.2.5-1)
-   wget https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/{VERSION}/luci-app-passwall2_{VERSION}_all.ipk
-   ```
+| 场景 | 行为与边界 |
+| --- | --- |
+| 同核心运行时配置 / 节点变化 | 能力检查通过时原生热更新；既有连接继续使用旧配置，新连接使用新配置。 |
+| ACL、监听器或 DNS 等结构变化 | 暂存 / 校验后按组件提交；可能蓝绿替换 DNS 或重新绑定被改变的监听器，不能保证每个组件 PID 都不变。 |
+| sing-box ↔ Xray 或不支持的静态变化 | 仅替换相关核心的兼容路径；该核心已有连接会断开，日志明确说明。 |
+| 无有效启动快照、提交中断或不兼容集合定义 | 回到完整重启 / 恢复路径，不伪装成无损成功。 |
+| 无效配置 | 拒绝应用并记录检查失败，不应先停掉正常服务再验证。 |
 
-3. **Install:**
-   ```bash
-   opkg update
-   opkg install luci-app-passwall2_*.ipk
-   ```
-   
-   > If installation fails due to missing dependencies (e.g., `xray-core`), you need to add the PassWall packages feed to `/etc/opkg/customfeeds.conf`.
+不会把一条已经连接服务器 A 的 TCP 会话搬到服务器 B。**“旧连接排空”与“连接迁移”是两回事**。TUN / WireGuard、FakeIP 地址池、日志和控制接口等静态部分仍有重启边界；保留代数达到上限时也可能需要重启。
 
-### For OpenWrt with APK 
+## 构建与核心配套
 
-1. **Download the APK package** from the releases page  
-   Look for `luci-app-passwall2_{VERSION}_all.apk` in the Assets section.
-   > **Note:** If you need localization (Chinese/Persian), download the corresponding language package as well (e.g., `luci-i18n-passwall2-zh-cn...` or `...-fa...`).
+当前补丁基线：
 
-2. **Upload to your router** (via SCP, LuCI upload, or wget):
-   ```bash
-   # Replace {VERSION} with the actual version (e.g., 26.2.5-1)
-   wget https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/{VERSION}/luci-app-passwall2_{VERSION}_all.apk
-   ```
+- **sing-box 1.14.2**，构建需包含 `with_clash_api`。
+- **Xray-core 26.9.30**。
+- 对应补丁按准确版本放在 [patches/cores](patches/cores/)；不能不处理冲突就套到其他版本。
 
-3. **Install:**
-   ```bash
-   apk add --allow-untrusted luci-app-passwall2_*.apk
-   ```
-   
-   > ⚠️ **Security Note:** `--allow-untrusted` bypasses package signature verification. 
+只安装本 fork 的 LuCI 包、仍使用未经修改的上游核心，**不能获得本 fork 的原生热重载能力**。先检查核心能力，再谈是否无损应用：
 
-> **How to check your package manager:** Run `opkg --version` or `apk --version` to see which one your router uses.
-
-### Restart LuCI
-```bash
-/etc/init.d/rpcd restart
+```sh
+sing-box hot-reload-capabilities
+xray api reloadconfig --local
 ```
 
-### 🧩 Add PassWall2 APK repository (recommended)
-**Instead of installing .apk packages manually**, you can add the PassWall2 APK repository and signing key to enable installation and updates via apk.
+这些是定制核心的能力探测，不是上游所有版本都有的命令。能力不足或静态变更时会选择兼容路径；以日志和实际进程 / 连接状态为准。
 
-1. Add repository signing key
+在 OpenWrt SDK / 构建树中，将本仓库的 `luci-app-passwall2` 作为包源码，并为匹配的核心配方加入对应补丁。完整集成示例见配套 [OpenWRT-CI 的 Office/packages.sh](https://github.com/Altars3668/OpenWRT-CI/blob/main/Office/packages.sh)，包括固定核心来源、补丁版本检查和编译工具链处理。
 
-```bash
-wget -O passwall.pub https://sourceforge.net/projects/openwrt-passwall-build/files/apk.pub
-mv passwall.pub /etc/apk/keys/
+当前没有可依赖的预编译应用 Release。配套固件是另外的发布产物，不能把“存在源码或补丁”当作“所有目标已编译通过”。
+
+## 使用与诊断
+
+1. 备份 UCI 配置和旧包 / 核心，保留独立的远程恢复通道。
+2. 安装匹配的应用与定制核心，首次启动建立运行快照；首次升级可能仍需要完整重启。
+3. 此后 LuCI 保存应用由 UCI / procd 触发 `reload`，执行器选择适合当前变化的路径。
+4. 结合日志、进程 PID、DNS 状态及已有连接检查应用结果，而不是只看网页提示。
+
+```sh
+# 在已部署相应版本的路由器上诊断；plan 需要服务的运行状态
+lua /usr/share/passwall2/reload.lua plan
+logread -e passwall2
 ```
 
-2. Add PassWall2 repositories
+手工 `/etc/init.d/passwall2 reload` 是**状态变更操作**，不是只读检查；在经该路由器远程操作时应先安排保护与回滚。
 
-```bash
-. /etc/openwrt_release
+## 验证与安全边界
 
-release="${DISTRIB_RELEASE%.*}"
-arch="$DISTRIB_ARCH"
+[tests](tests/) 包含纯 Lua 逻辑、配置生成、独立网络命名空间中的防火墙等价性、真实核心 loopback 生命周期，以及实机应用 / 回滚测试。
 
-wget -O /etc/apk/keys/passwall.pub \
-  https://sourceforge.net/projects/openwrt-passwall-build/files/apk.pub
-
-cat >> /etc/apk/repositories.d/customfeeds.list <<EOF
-https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${release}/${arch}/passwall_packages/packages.adb
-https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${release}/${arch}/passwall_luci/packages.adb
-https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${release}/${arch}/passwall2/packages.adb
-EOF
+```sh
+# 不连接路由器的本地逻辑测试，在源码根目录运行
+lua tests/reload_logic_test.lua "$PWD"
+lua tests/reconcile_logic_test.lua "$PWD"
+lua tests/server_migrate_test.lua "$PWD"
+python3 -I tests/init_reload_test.py
+python3 -I tests/direct_dns_test.py
 ```
 
-3. Update package index
+- 防火墙命名空间测试有工具和权限要求；真实核心测试需要匹配的已打补丁二进制，不能混用结果。
+- `home_*` / `office_deploy.sh` 是**可能改动真实设备的测试或部署工具**，不能当作普通单元测试一键执行。公开测试的设备入口需用自己的环境配置。
+- 含 API secret 的配置、运行元数据及 `/tmp/etc/passwall2/reload/` 事务文件需要保密，不能原样上传诊断日志。
+- 私有开发分支发布到 GitHub 前必须经过配套 CI 仓库的脱敏发布脚本；不要直接强制推送完整私有历史。
+- 更换代理核心包可能覆盖定制二进制，应把补丁接入自己的包构建流程，而不是仅手工替换文件。
 
-```bash
-apk update
-```
+## 来源与许可证
 
-4. Install optional dependency packages (depending on your configuration) and PassWall2 from repository
+保留 [Openwrt-Passwall](https://github.com/Openwrt-Passwall/openwrt-passwall2) 的来源、版权与许可证声明；定制服务逻辑和核心补丁由 Altars3668 维护。应用授权以仓库许可证和源码为准，sing-box / Xray 及其他依赖遵循各自许可证。
 
-```bash
-apk add tcping geoview # add other dependencies
-
-apk add luci-app-passwall2
-```
-
-
-## 📋 System Requirements
-
-### OpenWrt Version
-- OpenWrt 21.02 or later
-- LuCI 17.01 or later
-
-### Hardware Requirements
-- **Minimum 256MB RAM**
-- Sufficient storage for packages (varies by protocol selection)
-
-### Core Dependencies
-The following packages should be resolved automatically by the package manager (if available in your feeds):
-
-- `coreutils`, `coreutils-base64`, `coreutils-nohup`
-- `curl`, `ip-full`, `libuci-lua`, `lua`, `luci-compat`, `luci-lib-jsonc`
-- `resolveip`, `tcping`, `unzip`
-- `geoview`, `v2ray-geoip`, `v2ray-geosite` (geo-routing data)
-
-> **Note:** Actual dependencies may vary based on selected features and your OpenWrt build. Ensure you have the necessary feeds configured.
-
-### Optional Protocol Packages
-Selected during installation based on your needs:
-- Xray
-- Sing-Box
-- Shadowsocks-Rust
-- ShadowsocksR
-- HAProxy
-
-## 🚀 Features
-
-### Multi-Protocol Support
-- **Xray** (HTTP, Socks, Shadowsocks, VMess, VLESS, Trojan, Hysteria2, WireGuard)
-- **Sing-Box** (HTTP, Socks, SSH, Shadowsocks, VMess, VLESS, Trojan, TUIC, Hysteria, Hysteria2, WireGuard, AnyTLS)
-- **Shadowsocks-Rust**
-- **ShadowsocksR** legacy support
-- **HAProxy** The Reliable, High Performance TCP/HTTP Load Balancer
-
-### Traffic Management
-- **Load Balancing**: Distribute traffic across multiple nodes
-- **Smart Routing**: Domain-based and geo-based routing rules
-- **DNS Control**: Advanced DNS filtering and DoH/DoT support
-- **Transparent Proxy**: Seamless network-wide proxy
-
-### Node Management
-- **Subscription Support**: Import nodes from subscription URLs
-- **Node Testing**: Built-in latency and connectivity testing
-- **Failover Support**: Automatic failover to backup nodes
-- **QR Code**: Generate and scan QR codes for node sharing
-
-### Access Control
-- **Per-Device Rules**: Configure proxy settings per device
-- **Domain/IP Filtering**: Whitelist/blacklist support
-- **Time-based Rules**: Schedule proxy usage
-
-## ⚙️ Configuration
-
-### Basic Setup
-
-1. **Access LuCI Interface:**
-   - Navigate to `Services` → `PassWall2`
-
-2. **Add Your First Node:**
-   - Go to `Node List` → `Add Node`
-   - Select protocol and fill in server details
-
-3. **Configure Basic Settings:**
-   - Select your default node
-   - Configure DNS settings
-   - Enable transparent proxy
-
-4. **Apply Configuration:**
-   - Click `Save & Apply`
-
-## 🌐 Language Support
-
-PassWall2 supports multiple languages:
-- 🇨🇳 Chinese (Simplified/Traditional)
-- 🇮🇷 Persian (فارسی)
-
-Language files are organized in `luci-app-passwall2/po/` subdirectories.
-
-## 🔧 Troubleshooting
-
-### Common Issues
-
-**Service Won't Start**
-```bash
-logread | grep passwall2
-```
-Check system logs, verify node configuration, and ensure required packages are installed.
-
-**DNS Issues**
-- Disable built-in DNS in browsers (Chrome: Settings → Privacy → Security → Disable "Use secure DNS")
-- Clear DNS cache after reboot: `ipconfig /flushdns` (Windows) or toggle airplane mode (mobile)
-
-**Connection Problems**
-- Test node connectivity
-- Check firewall rules
-- Verify transparent proxy settings
-
-### Debug Mode
-
-Enable debug logging in `Other Settings` and check:
-- Main log: `/tmp/log/passwall2.log`
-- Server log: `/tmp/log/passwall2_server.log`
-
-## 📄 License
-
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
-
-**Note**: This software is intended for legal use only. Users are responsible for complying with all applicable laws and regulations in their jurisdiction.
-
----
-
-## Stargazers over time
-[![Stargazers over time](https://starchart.cc/Openwrt-Passwall/openwrt-passwall2.svg?variant=adaptive)](https://starchart.cc/Openwrt-Passwall/openwrt-passwall2)
+相关项目：[RE-CS-02 固件 CI](https://github.com/Altars3668/OpenWRT-CI) · [上游 Passwall packages](https://github.com/Openwrt-Passwall/openwrt-passwall-packages)。

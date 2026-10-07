@@ -173,15 +173,55 @@ function copy_instance(var)
 	end
 end
 
+-- 所有节点域名（地址与下载地址），用于让节点域名始终经国内 DNS 解析。
+local function node_domains()
+	local result = {}
+	api.uci_foreach_c("nodes", function(t)
+		for _, address in ipairs({ t.address or "", t.download_address or "" }) do
+			address = address:lower()
+			if address ~= "engage.cloudflareclient.com" and datatypes.hostname(address) then result[#result + 1] = address end
+		end
+	end)
+	return result
+end
+
+-- 节点域名的转发规则写入 servers-file（不在 conf-dir 内）：dnsmasq 收到 SIGHUP 时重读该文件，
+-- 节点地址变化无需重启 DNS 实例。文件先写临时文件再改名，读者看不到半个文件。
+local function write_servers(path, local_dns)
+	local seen, lines = {}, {}
+	for _, domain in ipairs(node_domains()) do
+		for dns in string.gmatch(local_dns or "", '[^,]+') do
+			local line = string.format("server=/.%s/%s", domain, dns)
+			if not seen[line] then seen[line] = true; lines[#lines + 1] = line end
+		end
+	end
+	local out = io.open(path .. ".tmp", "w")
+	if not out then return false end
+	out:write(table.concat(lines, "\n") .. (#lines > 0 and "\n" or ""))
+	out:close()
+	return fs.rename(path .. ".tmp", path)
+end
+
+-- 热重载：按当前节点重写指定实例的节点域名转发规则；调用者随后向该 dnsmasq 发送 SIGHUP。
+function update_servers(var)
+	local base = api.CACHE_PATH .. "/dnsmasq_" .. (var["FLAG"] or "")
+	local local_dns = fs.readfile(base .. ".local_dns")
+	if not local_dns or not fs.access(base .. ".servers") or not write_servers(base .. ".servers", local_dns) then
+		os.exit(1)
+	end
+end
+
 function add_rule(var)
 	local FLAG = var["FLAG"]
 	local TMP_DNSMASQ_PATH = var["TMP_DNSMASQ_PATH"]
 	local DNSMASQ_CONF_FILE = var["DNSMASQ_CONF_FILE"]
+	local CACHE_CONF_FILE = var["CACHE_CONF_FILE"] or DNSMASQ_CONF_FILE
 	local DEFAULT_DNS = var["DEFAULT_DNS"]
 	local LOCAL_DNS = var["LOCAL_DNS"]
 	local TUN_DNS = var["TUN_DNS"]
 	local NFTFLAG = var["NFTFLAG"]
-	local CACHE_PATH = api.CACHE_PATH
+	-- 影子启动把实例缓存写到暂存目录，不改动运行中实例读取的缓存（servers-file 会在 SIGHUP 时重读）。
+	local CACHE_PATH = os.getenv("PW2_DNSMASQ_CACHE") or api.CACHE_PATH
 	local CACHE_FLAG = "dnsmasq_" .. FLAG
 	local CACHE_DNS_PATH = CACHE_PATH .. "/" .. CACHE_FLAG
 	local CACHE_TEXT_FILE = CACHE_DNS_PATH .. ".txt"
@@ -260,7 +300,8 @@ function add_rule(var)
 
 	local cache_text = ""
 	local nodes_address_md5 = sys.exec("echo -n $(uci show %s | grep '\\.address') | md5sum" % c_config)
-	local new_text = TMP_DNSMASQ_PATH .. DNSMASQ_CONF_FILE .. DEFAULT_DNS .. LOCAL_DNS .. TUN_DNS .. nodes_address_md5 .. NFTFLAG
+	-- 末尾的布局标记让旧版本留下的缓存（节点域名转发写在 conf-dir 中）在升级后重建一次。
+	local new_text = TMP_DNSMASQ_PATH .. CACHE_CONF_FILE .. DEFAULT_DNS .. LOCAL_DNS .. TUN_DNS .. nodes_address_md5 .. NFTFLAG .. "|servers-file"
 	if fs.access(CACHE_TEXT_FILE) then
 		for line in io.lines(CACHE_TEXT_FILE) do
 			cache_text = line
@@ -298,19 +339,18 @@ function add_rule(var)
 			end)
 		end
 
+		-- 节点域名转发改用 servers-file（见 write_servers）；即使暂时没有节点域名也建立空文件，便于以后热更新。
+		fs.writefile(CACHE_DNS_PATH .. ".local_dns", fwd_dns or "")
+		write_servers(CACHE_DNS_PATH .. ".servers", fwd_dns)
+		fs.writefile(CACHE_DNS_PATH .. "/000-servers-file.conf", "servers-file=" .. CACHE_DNS_PATH .. ".servers\n")
+
 		if list1 and next(list1) then
-			local server_out = io.open(CACHE_DNS_PATH .. "/001-server.conf", "a")
 			local ipset_out = io.open(CACHE_DNS_PATH .. "/ipset.conf", "a")
 			local set_name = "ipset"
 			if NFTFLAG == "1" then
 				set_name = "nftset"
 			end
 			for key, value in pairs(list1) do
-				if value.dns and #value.dns > 0 then
-					for i, dns in ipairs(value.dns) do
-						server_out:write(string.format("server=/.%s/%s", key, dns) .. "\n")
-					end
-				end
 				if value.ipsets and #value.ipsets > 0 then
 					local ipsets_str = ""
 					for i, ipset in ipairs(value.ipsets) do
@@ -320,7 +360,6 @@ function add_rule(var)
 					ipset_out:write(string.format("%s=/.%s/%s", set_name, key, ipsets_str) .. "\n")
 				end
 			end
-			server_out:close()
 			ipset_out:close()
 		end
 
@@ -361,6 +400,7 @@ _G.restart = restart
 _G.logic_restart = logic_restart
 _G.copy_instance = copy_instance
 _G.add_rule = add_rule
+_G.update_servers = update_servers
 
 if arg[1] then
 	local func =_G[arg[1]]

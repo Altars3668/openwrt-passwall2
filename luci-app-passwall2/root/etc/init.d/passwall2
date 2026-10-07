@@ -5,29 +5,82 @@ STOP=15
 
 . $IPKG_INSTROOT/usr/share/passwall2/utils.sh
 APP_FILE=${APP_PATH}/app.sh
+# 仅在服务操作期间存在；订阅与规则更新按其存在性判断服务是否忙碌。
 LOCK_FILE=${LOCK_PATH}/${CONFIG}.lock
+# 互斥锁本体，保持同一 inode，不随解锁删除。
+FLOCK_FILE=${LOCK_PATH}/${CONFIG}.flock
+PENDING_FILE=${LOCK_PATH}/${CONFIG}_reload.pending
+CRON_FILE=${LOCK_PATH}/${CONFIG}_cron.lock
+LOCK_WAIT=30
 
 set_lock() {
-	[ ! -d "$LOCK_PATH" ] && mkdir -p $LOCK_PATH
-	exec 999>"$LOCK_FILE"
-	flock -xn 999
+	[ ! -d "$LOCK_PATH" ] && mkdir -p "$LOCK_PATH"
+	exec 9>"$FLOCK_FILE"
+	local remaining=${1:-0}
+	while ! flock -xn 9; do
+		[ "$remaining" -le 0 ] && { exec 9>&-; return 1; }
+		remaining=$((remaining - 1))
+		sleep 1
+	done
+	echo "$$" > "$LOCK_FILE"
 }
 
 unset_lock() {
-	flock -u 999
-	rm -rf "$LOCK_FILE"
+	rm -f "$LOCK_FILE"
+	flock -u 9
+	exec 9>&-
 }
 
-unlock() {
-	failcount=1
-	while [ "$failcount" -le 10 ]; do
-		if [ -f "$LOCK_FILE" ]; then
-			let "failcount++"
-			sleep 1s
-			[ "$failcount" -ge 10 ] && unset_lock
-		else
-			break
-		fi
+# 更新任务异常退出会留下锁文件；仅在确认没有对应进程时清理，无法判断时按运行中处理。
+update_running() {
+	[ -f "$1" ] || return 1
+	busybox pgrep -f "^([^ ]*/)?lua [^ ]*/${CONFIG}/$2( |$)" >/dev/null 2>&1
+	[ "$?" -eq 1 ] || return 0
+	rm -f "$1"
+	return 1
+}
+
+wait_updates() {
+	local rule_lock=${LOCK_PATH}/${CONFIG}_rule_update.lock
+	local sub_lock=${LOCK_PATH}/${CONFIG}_subscribe.lock
+	local i
+	for i in $(seq 1 300); do
+		update_running "$rule_lock" "rule_update\\.lua" || update_running "$sub_lock" "subscribe\\.lua" || return 0
+		sleep 2
+	done
+	rm -f "$rule_lock" "$sub_lock"
+}
+
+# 子进程关闭锁描述符，避免长期运行的核心或看门狗在脚本异常退出后继续持锁。
+restart_locked() {
+	wait_updates
+	rm -f "$PENDING_FILE"
+	$APP_FILE stop 9>&-
+	$APP_FILE start "$1" 9>&-
+}
+
+apply_reload() {
+	wait_updates
+	rm -f "$PENDING_FILE"
+	$APP_FILE reload 9>&-
+	local status=$?
+	if [ "$status" -eq 2 ]; then
+		log 0 "无法热重载（升级后尚无重载快照、上次差量提交被中断等），执行完整重启。"
+		$APP_FILE stop 9>&-
+		$APP_FILE start 9>&-
+		return $?
+	fi
+	# 没有经过 start，计划任务留给本次重启的跳过标记已无意义。
+	rm -f "$CRON_FILE"
+	return "$status"
+}
+
+# 持锁期间有配置提交时，结束前补做一次，避免变更丢失。
+drain_pending() {
+	local i
+	for i in 1 2 3; do
+		[ -f "$PENDING_FILE" ] || return 0
+		apply_reload
 	done
 }
 
@@ -49,39 +102,41 @@ boot() {
 }
 
 start() {
-	set_lock
-	[ $? == 1 ] && log_i18n 0 "The script is already running, do not run it again. Exit." && exit 0
-	$APP_FILE start
+	set_lock "$LOCK_WAIT" || { log_i18n 0 "The script is already running, do not run it again. Exit."; return 1; }
+	rm -f "$PENDING_FILE"
+	$APP_FILE start 9>&-
+	local status=$?
+	drain_pending
 	unset_lock
+	return "$status"
 }
 
 stop() {
-	unlock
-	set_lock
-	[ $? == 1 ] && log_i18n 0 "Stop the script and wait for a timeout, then exit without repeating the process." && exit 0
-	$APP_FILE stop
+	set_lock "$LOCK_WAIT" || { log_i18n 0 "Stop the script and wait for a timeout, then exit without repeating the process."; return 1; }
+	$APP_FILE stop 9>&-
+	local status=$?
 	unset_lock
+	return "$status"
 }
 
 restart() {
-	set_lock
-	[ $? == 1 ] && log_i18n 0 "The script is already running, do not run it again. Exit." && exit 0
-	rule_lock=${LOCK_PATH}/${CONFIG}_rule_update.lock
-	sub_lock=${LOCK_PATH}/${CONFIG}_subscribe.lock
-	for i in $(seq 1 300); do
-		if [ ! -f "$rule_lock" ] && [ ! -f "$sub_lock" ]; then
-			break
-		fi
-		sleep 2
-	done
-	rm -f "$rule_lock" "$sub_lock"
-	$APP_FILE stop
-	$APP_FILE start $1
+	set_lock "$LOCK_WAIT" || { log_i18n 0 "The script is already running, do not run it again. Exit."; return 1; }
+	restart_locked "$1"
+	local status=$?
+	drain_pending
 	unset_lock
+	return "$status"
 }
 
 reload() {
-	echo "Warning: This service does not support configuration reloading"
-	echo "Performing full restart instead..."
-	restart
+	if ! set_lock "$LOCK_WAIT"; then
+		touch "$PENDING_FILE"
+		# 持锁者可能在标记写入前已完成检查，短暂重试，避免排队请求无人处理。
+		set_lock 3 || { log 0 "服务正在执行其它操作，配置应用已排队，当前操作结束后执行。"; return 0; }
+	fi
+	apply_reload
+	local status=$?
+	drain_pending
+	unset_lock
+	return "$status"
 }

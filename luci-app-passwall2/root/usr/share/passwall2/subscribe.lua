@@ -2510,7 +2510,8 @@ local function update_node(manual)
 	end
 
 	if manual ~= 1 then
-		luci.sys.call("/etc/init.d/passwall2 restart > /dev/null 2>&1 &")
+		-- reload 按配置差异选择：节点地址等变化热更新，确需重建时才完整重启。
+		luci.sys.call("/etc/init.d/passwall2 reload > /dev/null 2>&1 &")
 	end
 end
 

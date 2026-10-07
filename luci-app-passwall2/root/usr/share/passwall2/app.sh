@@ -67,6 +67,30 @@ check_run_environment() {
 	fi
 }
 
+# 原生热重载：核心带本机控制接口；sing-box 需要 with_clash_api，并使用实例级随机 secret。
+# 控制端口与 secret 按实例稳定分配，重新生成的配置与运行中的一致（见 get_new_port 的用途键）。
+prepare_reload_api() {
+	[ -n "$no_run" ] && return 0
+	[ "$1" = "sing-box" ] && ! echo "$2" | grep -qw "with_clash_api" && return 0
+	json_add_string "reload_api_port" "$(get_new_port auto tcp "${flag}:api")"
+	if [ "$1" = "sing-box" ]; then
+		local secret=$(stable_get "${flag}:secret")
+		[ -n "${secret}" ] || read -r secret < /proc/sys/kernel/random/uuid
+		stable_set "${flag}:secret" "${secret}"
+		json_add_string "reload_api_secret" "${secret}"
+		"$SINGBOX_BIN" hot-reload-capabilities >/dev/null 2>&1 && json_add_string "reload_native" "1"
+	else
+		local capability
+		capability=$("$XRAY_BIN" api reloadconfig --local 2>/dev/null) && json_add_string "reload_native" "1"
+		echo "${capability}" | grep -q '"geodata":true' && json_add_string "reload_geodata" "1"
+	fi
+	return 0
+}
+
+record_reload_instance() {
+	lua ${APP_PATH}/reload.lua record "$@" || log 0 "无法记录核心重载状态，下次应用将使用完整重启。"
+}
+
 run_xray() {
 	local flag node redir_port socks_address socks_port socks_username socks_password http_address http_port http_username http_password
 	local dns_listen_port direct_dns_query_strategy remote_dns_protocol remote_dns_udp_server remote_dns_udp_port remote_dns_tcp_server remote_dns_tcp_port remote_dns_doh remote_dns_client_ip remote_dns_detour remote_fakedns remote_dns_query_strategy dns_cache
@@ -106,10 +130,15 @@ run_xray() {
 		local dns_msg="DNS[${dns_listen_port}]:($(i18n "Direct DNS: %s" "${direct_dns_proto}://${direct_dns_server}:${direct_dns_port}")"
 		json_add_string "dns_listen_port" "${dns_listen_port}"
 		[ -n "$dns_cache" ] && json_add_string "dns_cache" "${dns_cache}"
+		# 记录替换为直连写集合 DNS 之前的直连 DNS，热切换全局节点时据此恢复。
+		json_add_string "direct_dns_base_proto" "${direct_dns_proto}"
+		json_add_string "direct_dns_base_server" "${direct_dns_server}"
+		json_add_string "direct_dns_base_port" "${direct_dns_port}"
 		[ "${node_protocol}" = "_shunt" ] && local write_ipset_direct=$(config_n_get $node write_ipset_direct 0)
 		[ "${write_ipset_direct}" = "1" ] && {
-			direct_dnsmasq_listen_port=$(get_new_port auto)
-			local direct_ipset_conf=${TMP_ACL_PATH}/dns_${flag}_direct.conf
+			# 与热切换全局节点时启动的服务同名同键：按实例与节点区分。
+			direct_dnsmasq_listen_port=$(get_new_port auto tcp,udp "${flag}:direct_dns:${node}")
+			local direct_ipset_conf=${TMP_ACL_PATH}/dns_${flag}_direct_${node}.conf
 			if [ "${nftflag}" = "1" ]; then
 				local direct_nftset4="psw2_${node}_white"
 				local direct_nftset6="psw2_${node}_white6"
@@ -185,6 +214,7 @@ run_xray() {
 
 	json_add_string "node" "${node}"
 
+	prepare_reload_api xray
 	local _json_arg="$(json_dump)"
 	lua $UTIL_XRAY gen_config "${_json_arg}" > $config_file
 
@@ -194,10 +224,13 @@ run_xray() {
 	$XRAY_BIN run -test -c "$config_file" > $test_log_file; local status=$?
 	if [ "${status}" == 0 ]; then
 		ln_run ${QUEUE_RUN} "$XRAY_BIN" xray $log_file run -c "$config_file"
+		record_reload_instance xray "$XRAY_BIN" "$config_file" "$log_file" "${_json_arg}"
 		[ -n "${log_out}" ] && log 2 ${log_out}
 		unset log_out
 	else
 		_error_log_file=$test_log_file
+		# 影子启动中的校验失败：热重载放弃本次变更并保留运行中的服务。
+		staging && echo "${flag}" >> $TMP_PATH/stage.errors
 		return ${status}
 	fi
 }
@@ -252,10 +285,15 @@ run_singbox() {
 		local dns_msg="DNS[${dns_listen_port}]:($(i18n "Direct DNS: %s" "${direct_dns_proto}://${direct_dns_server}:${direct_dns_port}")"
 		json_add_string "dns_listen_port" "${dns_listen_port}"
 		[ -n "$dns_cache" ] && json_add_string "dns_cache" "${dns_cache}"
+		# 记录替换为直连写集合 DNS 之前的直连 DNS，热切换全局节点时据此恢复。
+		json_add_string "direct_dns_base_proto" "${direct_dns_proto}"
+		json_add_string "direct_dns_base_server" "${direct_dns_server}"
+		json_add_string "direct_dns_base_port" "${direct_dns_port}"
 		[ "${node_protocol}" = "_shunt" ] && local write_ipset_direct=$(config_n_get $node write_ipset_direct 0)
 		[ "${write_ipset_direct}" = "1" ] && {
-			direct_dnsmasq_listen_port=$(get_new_port auto)
-			local direct_ipset_conf=${TMP_ACL_PATH}/dns_${flag}_direct.conf
+			# 与热切换全局节点时启动的服务同名同键：按实例与节点区分。
+			direct_dnsmasq_listen_port=$(get_new_port auto tcp,udp "${flag}:direct_dns:${node}")
+			local direct_ipset_conf=${TMP_ACL_PATH}/dns_${flag}_direct_${node}.conf
 			if [ "${nftflag}" = "1" ]; then
 				local direct_nftset4="psw2_${node}_white"
 				local direct_nftset6="psw2_${node}_white6"
@@ -339,6 +377,7 @@ run_singbox() {
 
 	json_add_string "node" "${node}"
 
+	prepare_reload_api sing-box "$singbox_tag"
 	local _json_arg="$(json_dump)"
 	lua $UTIL_SINGBOX gen_config "${_json_arg}" > $config_file
 
@@ -348,10 +387,12 @@ run_singbox() {
 	$SINGBOX_BIN check -c "$config_file" > $test_log_file 2>&1; local status=$?
 	if [ "${status}" == 0 ]; then
 		ln_run ${QUEUE_RUN} "$SINGBOX_BIN" "sing-box" "${log_file}" run -c "$config_file"
+		record_reload_instance sing-box "$SINGBOX_BIN" "$config_file" "$log_file" "${_json_arg}"
 		[ -n "${log_out}" ] && log 2 ${log_out}
 		unset log_out
 	else
 		_error_log_file=$test_log_file
+		staging && echo "${flag}" >> $TMP_PATH/stage.errors
 		return ${status}
 	fi
 }
@@ -359,6 +400,9 @@ run_singbox() {
 run_socks() {
 	local flag node bind socks_port config_file http_port http_config_file relay_port log_file no_run
 	eval_set_val $@
+	# 节点测速与自动切换探测的临时实例不属于服务状态：不写入稳定分配（见 utils.sh）与直连节点列表（生成器同样跳过），
+	# 也不登记热重载实例（见 reload.lua）。
+	case "${flag}" in url_test_*|test_node_*) export PW2_TEMPORARY=1 ;; esac
 	[ -n "$config_file" ] && [ -z "$(echo ${config_file} | grep $TMP_PATH)" ] && config_file=$TMP_PATH/$config_file
 	[ -n "$http_port" ] || http_port=0
 	[ -n "$http_config_file" ] && [ -z "$(echo ${http_config_file} | grep $TMP_PATH)" ] && http_config_file=$TMP_PATH/$http_config_file
@@ -434,9 +478,13 @@ run_socks() {
 		json_add_string "direct_dns_${DIRECT_DNS_PROTO}_server" "${DIRECT_DNS_SERVER}"
 		json_add_string "direct_dns_${DIRECT_DNS_PROTO}_port" "${DIRECT_DNS_PORT}"
 		json_add_string "direct_dns_query_strategy" "${DIRECT_DNS_QUERY_STRATEGY}"
+		prepare_reload_api sing-box "$($SINGBOX_BIN version | grep 'Tags:' | awk '{print $2}')"
 		local _json_arg="$(json_dump)"
 		lua $UTIL_SINGBOX gen_config "${_json_arg}" > $config_file
-		[ -z "$no_run" ] && ln_run ${QUEUE_RUN} "$SINGBOX_BIN" "sing-box" /dev/null run -c "$config_file"
+		[ -z "$no_run" ] && {
+			ln_run ${QUEUE_RUN} "$SINGBOX_BIN" "sing-box" /dev/null run -c "$config_file"
+			record_reload_instance sing-box "$SINGBOX_BIN" "$config_file" /dev/null "${_json_arg}"
+		}
 	;;
 	xray)
 		[ "$http_port" != "0" ] && {
@@ -461,9 +509,13 @@ run_socks() {
 		json_add_string "direct_dns_${DIRECT_DNS_PROTO}_server" "${DIRECT_DNS_SERVER}"
 		json_add_string "direct_dns_${DIRECT_DNS_PROTO}_port" "${DIRECT_DNS_PORT}"
 		json_add_string "direct_dns_query_strategy" "${DIRECT_DNS_QUERY_STRATEGY}"
+		prepare_reload_api xray
 		local _json_arg="$(json_dump)"
 		lua $UTIL_XRAY gen_config "${_json_arg}" > $config_file
-		[ -z "$no_run" ] && ln_run ${QUEUE_RUN} "$XRAY_BIN" "xray" $log_file run -c "$config_file"
+		[ -z "$no_run" ] && {
+			ln_run ${QUEUE_RUN} "$XRAY_BIN" "xray" $log_file run -c "$config_file"
+			record_reload_instance xray "$XRAY_BIN" "$config_file" "$log_file" "${_json_arg}"
+		}
 	;;
 	ssr)
 		json_add_string "local_addr" "${bind}"
@@ -518,7 +570,7 @@ run_socks() {
 	}
 	unset http_flag
 
-	[ -z "$no_run" ] && [ "${server_host}" != "127.0.0.1" ] && [ "$type" != "sing-box" ] && [ "$type" != "xray" ] && echo "${node}" >> $TMP_PATH/direct_node_list
+	[ -z "$no_run" ] && [ -z "${PW2_TEMPORARY}" ] && [ "${server_host}" != "127.0.0.1" ] && [ "$type" != "sing-box" ] && [ "$type" != "xray" ] && echo "${node}" >> $TMP_PATH/direct_node_list
 }
 
 socks_node_switch() {
@@ -584,7 +636,11 @@ start_socks() {
 
 				# Auto switch logic
 				local enable_autoswitch=$(config_n_get $id enable_autoswitch 0)
-				[ "$enable_autoswitch" = "1" ] && { $APP_PATH/socks_auto_switch.sh ${id} > /dev/null 2>&1 & }
+				if staging; then
+					[ "$enable_autoswitch" = "1" ] && echo "${id}" >> $TMP_PATH/autoswitch
+				else
+					[ "$enable_autoswitch" = "1" ] && { $APP_PATH/socks_auto_switch.sh ${id} > /dev/null 2>&1 & }
+				fi
 			done
 		}
 	}
@@ -819,14 +875,19 @@ run_ipset_dnsmasq() {
 
 acl_node() {
 	[ "$(uci -q get dhcp.@dnsmasq[0].dns_redirect)" == "1" ] && {
-		uci -q set ${CONFIG}.@global[0].dnsmasq_dns_redirect='1'
-		uci -q commit ${CONFIG}
-		uci -q set dhcp.@dnsmasq[0].dns_redirect='0'
-		uci -q commit dhcp
+		if staging; then
+			# 影子启动不改动 dhcp：记录下来由热重载提交时执行同样的迁移。
+			echo "DHCP_DNS_REDIRECT=1" >> $TMP_PATH/stage.env
+		else
+			uci -q set ${CONFIG}.@global[0].dnsmasq_dns_redirect='1'
+			uci -q commit ${CONFIG}
+			uci -q set dhcp.@dnsmasq[0].dns_redirect='0'
+			uci -q commit dhcp
 
-		json_init
-		json_add_string "LOG" "0"
-		lua $APP_PATH/helper_dnsmasq.lua restart "$(json_dump)"
+			json_init
+			json_add_string "LOG" "0"
+			lua $APP_PATH/helper_dnsmasq.lua restart "$(json_dump)"
+		fi
 	}
 	local run_func
 	[ -n "${XRAY_BIN}" ] && run_func="run_xray"
@@ -862,29 +923,39 @@ acl_node() {
 			if [ "${run_new_dnsmasq}" != "1" ]; then
 				#Rewrite the default DNS service configuration
 				#Modify the default dnsmasq service
-				lua $APP_PATH/helper_dnsmasq.lua stretch
+				# 影子启动不改动 dnsmasq 主实例：配置写入暂存文件，由热重载提交时安装并重启主实例。
+				local main_conf=${DEFAULT_DNSMASQ_CONF}
+				if staging; then
+					main_conf=$TMP_PATH/dnsmasq-main.conf
+				else
+					lua $APP_PATH/helper_dnsmasq.lua stretch
+				fi
 				json_init
 				json_add_string "FLAG" "${flag}"
 				json_add_string "TMP_DNSMASQ_PATH" "${DEFAULT_DNSMASQ_CONF_PATH}"
-				json_add_string "DNSMASQ_CONF_FILE" "${DEFAULT_DNSMASQ_CONF}"
+				json_add_string "DNSMASQ_CONF_FILE" "${main_conf}"
+				# 缓存标记按主实例配置的真实路径计算：影子启动只是把配置写进暂存文件，生成的缓存与完整启动相同。
+				json_add_string "CACHE_CONF_FILE" "${DEFAULT_DNSMASQ_CONF}"
 				json_add_string "DEFAULT_DNS" "${DNSMASQ_DEFAULT_DNS}"
 				json_add_string "LOCAL_DNS" "${DNSMASQ_LOCAL_DNS}"
 				json_add_string "TUN_DNS" "${DNSMASQ_TUN_DNS}"
 				json_add_string "NFTFLAG" "${nftflag:-0}"
 				json_add_string "NO_LOGIC_LOG" "${NO_LOGIC_LOG:-0}"
 				lua $APP_PATH/helper_dnsmasq.lua add_rule "$(json_dump)"
-				uci -q add_list dhcp.@dnsmasq[0].addnmount=${DEFAULT_DNSMASQ_CONF_PATH}
-				uci -q commit dhcp
+				staging || {
+					uci -q add_list dhcp.@dnsmasq[0].addnmount=${DEFAULT_DNSMASQ_CONF_PATH}
+					uci -q commit dhcp
 
-				lua $APP_PATH/helper_dnsmasq.lua logic_restart
+					lua $APP_PATH/helper_dnsmasq.lua logic_restart
+				}
 			fi
 		fi
 		[ "${run_new_dnsmasq}" == "1" ] && {
 			#Run a copy dnsmasq instance, DNS hijack for that need proxy devices.
-			dnsmasq_port=$(get_new_port auto)
+			dnsmasq_port=$(get_new_port auto tcp,udp "${flag}:dnsmasq")
 			run_copy_dnsmasq flag="${flag}" listen_port=${dnsmasq_port} local_dns="${DNSMASQ_LOCAL_DNS}" tun_dns="${DNSMASQ_TUN_DNS}" default_dns="${DNSMASQ_DEFAULT_DNS}"
 			#dhcp.leases to hosts
-			$APP_PATH/lease2hosts.sh > /dev/null 2>&1 &
+			staging || { $APP_PATH/lease2hosts.sh > /dev/null 2>&1 & }
 			log 2 "Dnsmasq[${dnsmasq_port}]:(127.0.0.1:${dns_listen_port})"
 		}
 		rm -f ${TMP_ACL_PATH}/acl_node_${nid}
@@ -892,7 +963,7 @@ acl_node() {
 }
 
 start() {
-	busybox pgrep -f ${TMP_PATH}/bin > /dev/null 2>&1 && {
+	! staging && busybox pgrep -f ${TMP_PATH}/bin > /dev/null 2>&1 && {
 		logger -t PW2-RESTART "Upgrade or overload residue is detected, and the subprocess is being called to perform complete cleaning..."
 		(stop)
 		sleep 2
@@ -923,6 +994,19 @@ start() {
 			set_cache_var "USE_TABLES" "$USE_TABLES"
 		fi
 	}
+	if staging; then
+		# 影子启动到此为止：记录提交时需要的启动结论，不改动 sysctl、不启动进程、不重建计划任务。
+		cat >> $TMP_PATH/stage.env <<-EOF
+			ENABLED=${ENABLED}
+			ENABLED_DEFAULT_ACL=${ENABLED_DEFAULT_ACL}
+			ENABLED_ACLS=${ENABLED_ACLS}
+			USE_TABLES=${USE_TABLES}
+			PROXY_IPV6=${PROXY_IPV6}
+			NODE=${NODE}
+		EOF
+		log_i18n 0 "Running complete!"
+		return 0
+	fi
 	if [ "$ENABLED_DEFAULT_ACL" == 1 ] || [ "$ENABLED_ACLS" == 1 ]; then
 		bridge_nf_ipt=$(sysctl -e -n net.bridge.bridge-nf-call-iptables)
 		set_cache_var "bak_bridge_nf_ipt" "$bridge_nf_ipt"
@@ -938,6 +1022,7 @@ start() {
 		rm -f "${LOCK_PATH}/${CONFIG}_cron.lock"
 	}
 	start_crontab
+	lua ${APP_PATH}/reload.lua snapshot || log 0 "无法保存重载快照，下次应用将使用完整重启。"
 	log_i18n 0 "Running complete!"
 	echolog "\n"
 
@@ -953,6 +1038,7 @@ start() {
 			lua $APP_PATH/subscribe.lua start $cfgids cron > /dev/null 2>&1 &
 		}
 	}
+	return 0
 }
 
 stop() {
@@ -1034,8 +1120,10 @@ get_direct_dns() {
 	DIRECT_DNS_PORT=${DIRECT_DNS_PORT:-53}
 
 	local direct_dns_protocol=$(config_n_get @global[0] direct_dns_protocol)
-	if [ "${direct_dns_protocol}" = "tcp" ] || [ "${direct_dns_protocol}" = "udp" ]; then
-		local DIRECT_DNS=$(config_n_get @global[0] direct_dns)
+	local DIRECT_DNS=$(config_n_get @global[0] direct_dns)
+	# 选了 UDP/TCP 却没有填写服务器（不经本页面保存的配置，例如从其它分支迁移来）时保持自动获取：
+	# parseDNS 会把空值解析成 ("", 53)，拆分后服务器成了“53”、端口为空，国内域名将全部解析失败。
+	if [ -n "${DIRECT_DNS}" ] && { [ "${direct_dns_protocol}" = "tcp" ] || [ "${direct_dns_protocol}" = "udp" ]; }; then
 		local result=$(lua_api "parseDNS(\"${DIRECT_DNS}\")")
 		[ "${result}" != "nil" ] && {
 			DIRECT_DNS_PROTO="${direct_dns_protocol}"
@@ -1077,6 +1165,57 @@ get_config() {
 	QUEUE_RUN=1
 }
 
+# 热切换全局节点时为新的分流节点启动直连写集合 DNS，参数与启动时 run_xray/run_singbox 一致。
+# 使用按节点区分的配置文件，不覆盖仍在运行的旧服务；最后一行输出监听端口。
+reload_direct_dns() {
+	local flag=${1} node=${2}
+	[ -n "${flag}" ] && [ -n "${node}" ] || return 1
+	local tables=$(get_cache_var "USE_TABLES")
+	[ "${tables}" = "nftables" ] || [ "${tables}" = "iptables" ] || return 1
+	get_direct_dns
+	local listen_port=$(get_new_port auto tcp,udp "${flag}:direct_dns:${node}")
+	local set4="psw2_${node}_white"
+	local set6="psw2_${node}_white6"
+	local conf=${TMP_ACL_PATH}/dns_${flag}_direct_${node}.conf
+	if [ "${tables}" = "nftables" ]; then
+		run_ipset_dns_server listen_port=${listen_port} proto=${DIRECT_DNS_PROTO} server_dns="${DIRECT_DNS_SERVER}#${DIRECT_DNS_PORT}" nftset="4#inet#passwall2#${set4},6#inet#passwall2#${set6}" config_file=${conf}
+		set_cache_var "node_${node}_direct_nftset4" "${set4}"
+		set_cache_var "node_${node}_direct_nftset6" "${set6}"
+	else
+		run_ipset_dns_server listen_port=${listen_port} proto=${DIRECT_DNS_PROTO} server_dns="${DIRECT_DNS_SERVER}#${DIRECT_DNS_PORT}" ipset="${set4},${set6}" config_file=${conf}
+		set_cache_var "node_${node}_direct_ipset4" "${set4}"
+		set_cache_var "node_${node}_direct_ipset6" "${set6}"
+	fi
+	echo "PORT=${listen_port}"
+}
+
+# 计划任务、看门狗与循环更新进程的热更新：定时选项变化时由 reload 调用，不触碰代理核心、DNS 与防火墙。
+reload_crontab() {
+	ENABLED=$(config_n_get @global[0] enabled 0)
+	# 与 start 一致：只有透明代理在运行（启动时记录了防火墙后端）才启动看门狗与循环更新。
+	ENABLED_DEFAULT_ACL=0
+	ENABLED_ACLS=0
+	[ -n "$(get_cache_var "USE_TABLES")" ] && ENABLED_DEFAULT_ACL=1
+	# OpenWrt 的 busybox 通常没有 pkill；字符类写法避免匹配到调用者自身的命令行。
+	local pid
+	for pid in $(busybox pgrep -f "${APP_PATH}/monito[r].sh") $(busybox pgrep -f "${APP_PATH}/task[s].sh"); do
+		kill "${pid}" 2>/dev/null
+	done
+	rm -f "${LOCK_PATH}/${CONFIG}_monitor.lock"
+	start_crontab
+}
+
+reload() {
+	# 兼容路径可能重新拉起核心，与 start 保持相同的文件描述符上限与环境。
+	ulimit -n 65535
+	export V2RAY_LOCATION_ASSET=$(config_n_get @global_rules[0] v2ray_location_asset "/usr/share/v2ray/")
+	export XRAY_LOCATION_ASSET=$V2RAY_LOCATION_ASSET
+	export ENABLE_DEPRECATED_GEOSITE=true
+	export ENABLE_DEPRECATED_GEOIP=true
+	export SS_SYSTEM_DNS_RESOLVER_FORCE_BUILTIN=1
+	lua ${APP_PATH}/reload.lua apply
+}
+
 arg1=$1
 shift
 case $arg1 in
@@ -1093,7 +1232,22 @@ socks_node_switch)
 start)
 	start $@
 	;;
+stage)
+	# 只由 reload.lua 设置 PW2_STAGE 与暂存目录后调用；任何情况下都不会写正式目录。
+	staging && [ "$TMP_PATH" != "/tmp/etc/${CONFIG}" ] || exit 1
+	mkdir -p $TMP_PATH
+	start
+	;;
 stop)
 	stop
+	;;
+reload)
+	reload
+	;;
+reload_direct_dns)
+	reload_direct_dns "$@"
+	;;
+reload_crontab)
+	reload_crontab
 	;;
 esac

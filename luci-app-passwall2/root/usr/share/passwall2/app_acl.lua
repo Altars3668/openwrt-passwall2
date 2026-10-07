@@ -16,6 +16,14 @@ local L = {
 	node_order = {}
 }
 
+-- 旧版本用 "disable" 表示不排除端口、访问控制用 "default" 表示沿用全局设置；新版本分别用空值与显式端口。
+-- 直接传给防火墙会生成无效规则（如 tcp dport {disable}），这里按旧语义换算。
+local function ports(value, inherit)
+	if value == nil or value == "" or value == "disable" then return nil end
+	if value == "default" then return inherit end
+	return value
+end
+
 function add_args(t, k, v)
 	if not t or not k or not v then return end
 	table.insert(t, k .. "=" .. '"' .. v .. '"')
@@ -26,10 +34,10 @@ function init_acl()
 		-- Get Default AC
 		D.flag = "acl_default"
 		D.remarks = api.i18n.translatef("Default")
-		D.tcp_no_redir_ports = uci_get("@global_forwarding[0]", "tcp_no_redir_ports")
-		D.udp_no_redir_ports = uci_get("@global_forwarding[0]", "udp_no_redir_ports")
-		D.tcp_redir_ports = uci_get("@global_forwarding[0]", "tcp_redir_ports")
-		D.udp_redir_ports = uci_get("@global_forwarding[0]", "udp_redir_ports")
+		D.tcp_no_redir_ports = ports(uci_get("@global_forwarding[0]", "tcp_no_redir_ports"))
+		D.udp_no_redir_ports = ports(uci_get("@global_forwarding[0]", "udp_no_redir_ports"))
+		D.tcp_redir_ports = ports(uci_get("@global_forwarding[0]", "tcp_redir_ports"))
+		D.udp_redir_ports = ports(uci_get("@global_forwarding[0]", "udp_redir_ports"))
 		D.node = uci_get("@global[0]", "node")
 		D.local_proxy = uci_get("@global[0]", "localhost_proxy")
 		D.client_proxy = uci_get("@global[0]", "client_proxy")
@@ -43,8 +51,8 @@ function init_acl()
 					loglevel = uci_get("@global[0]", "loglevel") or "warn",
 					socks_listen = uci_get("@global[0]", "node_socks_bind_local") == "0" and "0.0.0.0" or "127.0.0.1",
 					socks_port = uci_get("@global[0]", "node_socks_port"),
-					redir_port = api.get_new_port(),
-					dns_port = api.get_new_port(),
+					redir_port = api.get_new_port(nil, D.flag .. ":redir"),
+					dns_port = api.get_new_port(nil, D.flag .. ":dns"),
 					direct_dns_query_strategy = uci_get("@global[0]", "direct_dns_query_strategy") or "UseIP",
 					remote_dns_protocol = uci_get("@global[0]", "remote_dns_protocol") or "tcp",
 					remote_dns_detour = uci_get("@global[0]", "remote_dns_detour") or "remote",
@@ -72,11 +80,18 @@ function init_acl()
 				a.flag = o[".name"]
 				a.remarks = o.remarks
 				a.interface = o.interface
-				a.sources = o.sources
-				a.tcp_no_redir_ports = o.tcp_no_redir_ports
-				a.udp_no_redir_ports = o.udp_no_redir_ports
-				a.tcp_redir_ports = o.tcp_redir_ports
-				a.udp_redir_ports = o.udp_redir_ports
+				-- 旧版本把来源保存为空格分隔的单个选项，新版本是列表；两种都接受。
+				local sources = o.sources
+				if type(sources) == "string" then
+					local list = {}
+					for w in sources:gmatch("%S+") do list[#list + 1] = w end
+					sources = list
+				end
+				a.sources = sources
+				a.tcp_no_redir_ports = ports(o.tcp_no_redir_ports, D.tcp_no_redir_ports)
+				a.udp_no_redir_ports = ports(o.udp_no_redir_ports, D.udp_no_redir_ports)
+				a.tcp_redir_ports = ports(o.tcp_redir_ports, D.tcp_redir_ports)
+				a.udp_redir_ports = ports(o.udp_redir_ports, D.udp_redir_ports)
 				a.client_proxy = "1"
 				a.local_proxy = "0"
 				a.node = o.node
@@ -103,8 +118,8 @@ function init_acl()
 							enabled = "1",
 							log = o.log or "0",
 							loglevel = o.loglevel or "warn",
-							redir_port = api.get_new_port(),
-							dns_port = api.get_new_port(),
+							redir_port = api.get_new_port(nil, a.flag .. ":redir"),
+							dns_port = api.get_new_port(nil, a.flag .. ":dns"),
 							direct_dns_query_strategy = o.direct_dns_query_strategy,
 							remote_dns_protocol = o.remote_dns_protocol,
 							remote_dns_detour = o.remote_dns_detour,

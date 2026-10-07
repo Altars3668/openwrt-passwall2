@@ -4,6 +4,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 MY_PATH=$DIR/nftables.sh
 UTILS_PATH=$DIR/utils.sh
 NFTABLE_NAME="inet passwall2"
+# 影子启动（见 app.sh stage）把规则写入不挂钩子的影子表：可以照常生成、查询与按位置插入，但不处理任何报文。
+[ -n "${PW2_STAGE}" ] && NFTABLE_NAME="inet passwall2_stage"
 NFTSET_LOCAL="psw2_local"
 NFTSET_DIRECT="psw2_direct"
 NFTSET_VPS="psw2_vps"
@@ -15,6 +17,8 @@ NFTSET_VPS6="psw2_vps6"
 NFTSET_WAN6="psw2_wan6"
 
 FWMARK="0x50535732"
+# 使用默认实例（全局节点及跟随全局的访问控制）的分流项放在专用子链中，热切换全局节点时只替换子链内容。
+SHUNT_CHAINS="PSW2_SHUNT_NAT PSW2_SHUNT_MARK PSW2_SHUNT_MARK6 PSW2_SHUNT_ICMP PSW2_SHUNT_ICMP6"
 
 FWI=$(uci -q get firewall.passwall2.path 2>/dev/null)
 FAKE_IP="198.18.0.0/16"
@@ -126,24 +130,30 @@ destroy_nftset() {
 	done
 }
 
+# 基础链及其钩子；热重载提交时按同一份定义创建缺失的基础链（影子启动把它写入暂存目录）。
+NFT_BASE_CHAINS="dstnat|type nat hook prerouting priority dstnat - 1; policy accept;
+mangle_prerouting|type filter hook prerouting priority mangle - 1; policy accept;
+mangle_output|type route hook output priority mangle - 1; policy accept;
+nat_output|type nat hook output priority -1; policy accept;"
+
 gen_nft_tables() {
 	if ! nft list table "$NFTABLE_NAME" >/dev/null 2>&1; then
-		nft -f - <<-EOF
-		table $NFTABLE_NAME {
-			chain dstnat {
-				type nat hook prerouting priority dstnat - 1; policy accept;
-			}
-			chain mangle_prerouting {
-				type filter hook prerouting priority mangle - 1; policy accept;
-			}
-			chain mangle_output {
-				type route hook output priority mangle - 1; policy accept;
-			}
-			chain nat_output {
-				type nat hook output priority -1; policy accept;
-			}
-		}
-		EOF
+		[ -n "${PW2_STAGE}" ] && echo "${NFT_BASE_CHAINS}" > "$TMP_PATH/nft_base_chains"
+		echo "${NFT_BASE_CHAINS}" | awk -F '|' -v t="$NFTABLE_NAME" -v stage="${PW2_STAGE}" '
+			BEGIN { print "table " t " {" }
+			# 影子表中的基础链是普通链，不挂钩子。
+			{ print "\tchain " $1 " {"; if (stage == "") print "\t\t" $2; print "\t}" }
+			END { print "}" }
+		' | nft -f -
+	fi
+}
+
+# 热刷新时集合操作写入 NFT_SCRIPT，由调用者在一个 nft 事务中提交；未设置时保持原行为直接执行。
+nft_apply() {
+	if [ -n "${NFT_SCRIPT}" ]; then
+		cat >> "${NFT_SCRIPT}"
+	else
+		nft -f -
 	fi
 }
 
@@ -184,7 +194,7 @@ insert_nftset() {
 					if (first) print "\n }\n"
 				}
 			'
-		} | nft -f -
+		} | nft_apply
 	fi
 }
 
@@ -198,7 +208,15 @@ gen_nftset() {
 	local timeout_argument_element="${1}"; shift
 	local gc_interval_time="1h"
 
-	if ! nft list set $NFTABLE_NAME $nftset_name >/dev/null 2>&1; then
+	if [ -n "${NFT_SCRIPT}" ]; then
+		# 热刷新：同定义的 add set 对已存在的集合是空操作，随后在同一事务中清空并重新填充。
+		if [ "$timeout_argument_set" == "0" ]; then
+			echo "add set $NFTABLE_NAME $nftset_name { type $ip_type; flags interval, timeout; auto-merge; }"
+		else
+			echo "add set $NFTABLE_NAME $nftset_name { type $ip_type; flags interval, timeout; timeout $timeout_argument_set; gc-interval $gc_interval_time; auto-merge; }"
+		fi >> "${NFT_SCRIPT}"
+		echo "flush set $NFTABLE_NAME $nftset_name" >> "${NFT_SCRIPT}"
+	elif ! nft list set $NFTABLE_NAME $nftset_name >/dev/null 2>&1; then
 		if [ "$timeout_argument_set" == "0" ]; then
 			nft "add set $NFTABLE_NAME $nftset_name { type $ip_type; flags interval, timeout; auto-merge; }"
 		else
@@ -238,13 +256,22 @@ gen_shunt_list() {
 				[ -n "$shunt_node" ] && {
 					local nftset_v4="psw2_${node}_${shunt_id}"
 					local nftset_v6="psw2_${node}_${shunt_id}6"
-					gen_nftset $nftset_v4 ipv4_addr 0 0
-					gen_nftset $nftset_v6 ipv6_addr 0 0
 					local outbound="redirect"
 					[ "$shunt_node" = "_direct" ] && outbound="direct"
 					[ "$shunt_node" = "_default" ] && outbound="${default_outbound}"
 					_SHUNT_LIST4="${_SHUNT_LIST4} ${nftset_v4}:${outbound}"
 					_SHUNT_LIST6="${_SHUNT_LIST6} ${nftset_v6}:${outbound}"
+					# 热切换或同一节点再次使用时，已存在的集合沿用已载入的内容，避免重复解析 GeoIP。
+					[ -n "${SHUNT_PRESERVE_SETS}" ] && nft list set $NFTABLE_NAME $nftset_v4 >/dev/null 2>&1 && \
+						nft list set $NFTABLE_NAME $nftset_v6 >/dev/null 2>&1 && continue
+					gen_nftset $nftset_v4 ipv4_addr 0 0
+					gen_nftset $nftset_v6 ipv6_addr 0 0
+					# 影子启动：运行中已有的规则集合沿用原内容（内容变化由集合热刷新处理），影子表只建同名空集合供规则引用。
+					[ -n "${PW2_STAGE}" ] && [ -z "${PW2_STAGE_REFRESH}" ] && nft list set inet passwall2 $nftset_v4 >/dev/null 2>&1 && \
+						nft list set inet passwall2 $nftset_v6 >/dev/null 2>&1 && {
+						echo "$nftset_v4 $nftset_v6" >> "$TMP_PATH/preserved_sets"
+						continue
+					}
 					config_n_get $shunt_id ip_list | sed 's/#.*//' | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | insert_nftset $nftset_v4 "0"
 					config_n_get $shunt_id ip_list | sed 's/#.*//' | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | insert_nftset $nftset_v6 "0"
 					[ "${enable_geoview_ip}" = "1" ] && {
@@ -279,8 +306,33 @@ add_shunt_t_rule() {
 	local t_args=${2}
 	local t_jump_args=${3}
 	local t_comment=${4}
+	[ -n "${t_comment}" ] && t_comment="comment \"$t_comment\""
+	if [ "${shunt_args}" = "@global" ]; then
+		# 默认实例的分流列表只在主链留一条跳转；按地址族与动作选择共享子链。
+		local prefix chain
+		case "${t_args}" in
+			*" ip6 daddr")
+				prefix=${t_args% ip6 daddr}
+				chain=PSW2_SHUNT_MARK6
+				[ "${t_jump_args}" = "counter redirect" ] && chain=PSW2_SHUNT_ICMP6
+				;;
+			*)
+				prefix=${t_args% ip daddr}
+				case "${t_jump_args}" in
+					"counter redirect") chain=PSW2_SHUNT_ICMP ;;
+					"counter redirect to "*) chain=PSW2_SHUNT_NAT ;;
+					*) chain=PSW2_SHUNT_MARK ;;
+				esac
+				;;
+		esac
+		# 已由代理接管的流量不再按分流集合重新分类，热切换后已有 UDP 会话保持原路径。
+		case "${chain}" in
+			PSW2_SHUNT_MARK*) prefix="${prefix} ct mark != ${FWMARK}" ;;
+		esac
+		${prefix} counter jump ${chain} ${t_comment}
+		return
+	fi
 	[ -n "${shunt_args}" ] && {
-		[ -n "${t_comment}" ] && t_comment="comment \"$t_comment\""
 		for j in ${shunt_args}; do
 			local _set_name=$(echo ${j} | awk -F ':' '{print $1}')
 			local _outbound=$(echo ${j} | awk -F ':' '{print $2}')
@@ -293,13 +345,137 @@ add_shunt_t_rule() {
 	}
 }
 
+# 输出整套分流子链内容（先清空再填充），交给 nft -f 在同一个事务中原子替换。
+# 直连项用 accept 结束本钩子的基础链，与原先在主链中 return 的效果相同。
+gen_shunt_chains() {
+	local redir_port=${1}
+	local chain list match verdict item set_name outbound
+	for chain in ${SHUNT_CHAINS}; do
+		echo "flush chain $NFTABLE_NAME ${chain}"
+		case "${chain}" in
+			PSW2_SHUNT_NAT) list=${SHUNT_LIST4}; match="ip daddr"; verdict="counter redirect to :${redir_port}" ;;
+			PSW2_SHUNT_MARK) list=${SHUNT_LIST4}; match="ip daddr"; verdict="counter jump PSW2_RULE" ;;
+			PSW2_SHUNT_MARK6) list=${SHUNT_LIST6}; match="ip6 daddr"; verdict="counter jump PSW2_RULE" ;;
+			PSW2_SHUNT_ICMP) list=${SHUNT_LIST4}; match="ip daddr"; verdict="counter redirect" ;;
+			PSW2_SHUNT_ICMP6) list=${SHUNT_LIST6}; match="ip6 daddr"; verdict="counter redirect" ;;
+		esac
+		[ -n "${redir_port}" ] || list=""
+		for item in ${list}; do
+			set_name=${item%%:*}
+			outbound=${item##*:}
+			[ -n "${set_name}" ] && [ -n "${outbound}" ] || continue
+			if [ "${outbound}" = "direct" ]; then
+				echo "add rule $NFTABLE_NAME ${chain} ${match} @${set_name} counter accept"
+			elif [ "${chain}" = "PSW2_SHUNT_NAT" ]; then
+				# 端口重定向要求先匹配传输层协议；该子链只承接 TCP。
+				echo "add rule $NFTABLE_NAME ${chain} ip protocol tcp ${match} @${set_name} ${verdict}"
+			else
+				echo "add rule $NFTABLE_NAME ${chain} ${match} @${set_name} ${verdict}"
+			fi
+		done
+	done
+}
+
+shunt_ready() {
+	local chain
+	for chain in ${SHUNT_CHAINS}; do
+		nft list chain $NFTABLE_NAME ${chain} >/dev/null 2>&1 || return 2
+	done
+}
+
+# 热切换全局节点：只替换分流子链并补充新节点地址白名单；主链、DNS 劫持及其它规则保持不变。
+# 新连接立即按新规则分流；TCP 重定向只作用于新连接，已标记的 UDP 流按 conntrack 标记保持原路径。
+shunt_switch() {
+	local node=${1}
+	local redir_port=${2}
+	[ -n "${node}" ] && [ -n "${redir_port}" ] || return 1
+	[ -z "$(command -v log_i18n)" ] && . "$UTILS_PATH"
+	shunt_ready || return 2
+	SHUNT_PRESERVE_SETS=1
+	gen_shunt_list "${node}" SHUNT_LIST4 SHUNT_LIST6
+	gen_shunt_chains "${redir_port}" | nft -f - || return 1
+	filter_vps_addr $(config_n_get ${node} address) $(config_n_get ${node} download_address) >/dev/null 2>&1 &
+	gen_include
+}
+
+# 规则数据或分流规则内容更新后的热刷新：在一个 nft 事务中重建由规则派生的集合（直连集合、GeoIP 预加载集合），
+# 按上游 flush_set 语义清空直连写集合，并重填默认实例的分流子链；主链、DNS 劫持与 psw2_vps/local/wan 不变。
+# 独立访问控制实例只刷新集合内容：配置指纹保证其引用的集合名不变。flush=1 时先丢弃 geoip 解析缓存。
+refresh_sets() {
+	local node=${1}
+	local redir_port=${2}
+	local flush=${3}
+	[ -z "$(command -v log_i18n)" ] && . "$UTILS_PATH"
+	shunt_ready || return 2
+	[ "${flush}" = "1" ] && rm -rf "$TMP_PATH2/geo_output"
+	if [ -z "${ISP_DNS}${ISP_DNS6}" ]; then
+		local resolv=/tmp/resolv.conf.d/resolv.conf.auto
+		[ -s "${resolv}" ] || resolv=/tmp/resolv.conf.auto
+		ISP_DNS=$(cat $resolv 2>/dev/null | grep -E -o "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v -E '^(0\.0\.0\.0|127\.0\.0\.1)$' | awk '!seen[$0]++')
+		ISP_DNS6=$(cat $resolv 2>/dev/null | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | awk -F % '{print $1}' | awk -F " " '{print $2}' | grep -v -Fx ::1 | grep -v -Fx :: | awk '!seen[$0]++')
+	fi
+	local script="$TMP_PATH/refresh_sets.nft" var_file acl_use acl_node done_nodes=" "
+	: > "${script}"
+	NFT_SCRIPT="${script}"
+	gen_nftset $NFTSET_DIRECT ipv4_addr 0 "-1"
+	gen_nftset $NFTSET_DIRECT6 ipv6_addr 0 "-1"
+	fill_direct_sets
+	for var_file in "${TMP_ACL_PATH}"/*/var; do
+		[ -s "${var_file}" ] || continue
+		# var 文件可能有两行 node（条目自身的选项与所用实例的节点），与 eval 一致取最后一行。
+		acl_use=$(sed -n 's/^use="\(.*\)"$/\1/p' "${var_file}" | tail -n 1)
+		acl_node=$(sed -n 's/^node="\(.*\)"$/\1/p' "${var_file}" | tail -n 1)
+		[ "${acl_use}" = "acl_default" ] || [ -z "${acl_node}" ] && continue
+		case "${done_nodes}" in *" ${acl_node} "*) continue ;; esac
+		done_nodes="${done_nodes}${acl_node} "
+		[ "${acl_node}" = "${node}" ] && continue
+		gen_shunt_list "${acl_node}" _refresh_list4 _refresh_list6
+	done
+	unset SHUNT_LIST4 SHUNT_LIST6
+	[ -n "${node}" ] && gen_shunt_list "${node}" SHUNT_LIST4 SHUNT_LIST6
+	unset NFT_SCRIPT
+	# nft 的 auto-merge 在同一事务中 flush 之后，若同一集合的多条 add element 被其它语句隔开，
+	# 会按陈旧缓存删除已清空的元素而失败（ENOENT）：按集合归并成一条 add element 再提交。
+	awk '
+		$1 == "add" && $2 == "set" { name = $3 " " $4 " " $5; if (!(name in seen)) { seen[name] = 1; order[++n] = name }; def[name] = $0; next }
+		$1 == "flush" && $2 == "set" { name = $3 " " $4 " " $5; if (!(name in seen)) { seen[name] = 1; order[++n] = name }; flush[name] = 1; next }
+		$1 == "add" && $2 == "element" { cur = $3 " " $4 " " $5; if (!(cur in seen)) { seen[cur] = 1; order[++n] = cur }; next }
+		cur != "" && $0 ~ /^[ \t]*}[ \t]*$/ { cur = ""; next }
+		cur != "" { gsub(/^[ \t]+|[ \t,]+$/, ""); if ($0 != "") elems[cur] = (count[cur]++ ? elems[cur] ",\n" : "") $0; next }
+		{ rest[++m] = $0 }
+		END {
+			for (i = 1; i <= n; i++) {
+				name = order[i]
+				if (name in def) print def[name]
+				if (name in flush) print "flush set " name
+				if (name in elems) print "add element " name " {\n" elems[name] "\n}"
+			}
+			for (i = 1; i <= m; i++) print rest[i]
+		}
+	' "${script}" > "${script}.grouped" && mv -f "${script}.grouped" "${script}"
+	gen_shunt_chains "${redir_port}" >> "${script}"
+	nft -f "${script}" || return 1
+	gen_include
+}
+
 load_acl() {
-	log_i18n 1 "Access Control:"
-	acl_node
+	[ -n "${ACL_NODE_DONE}" ] || {
+		log_i18n 1 "Access Control:"
+		acl_node
+	}
 	for sid in $(jsonfilter -s "${ACL_JSON}" -e '$.acl[*].flag'); do
 		eval $(cat "${TMP_ACL_PATH}/${sid}/var")
 
-		[ -z "$(get_cache_var "node_${node}_gen_shunt_list")" ] && [ -n "${node}" ] && gen_shunt_list "${node}" shunt_list4 shunt_list6
+		# 使用默认实例的条目跳转到共享分流子链；独立实例按各自节点生成静态规则（同一节点的集合只载入一次）。
+		unset shunt_list4 shunt_list6
+		if [ "${use}" = "acl_default" ]; then
+			shunt_list4="@global"
+			shunt_list6="@global"
+		elif [ -n "${node}" ]; then
+			SHUNT_PRESERVE_SETS=1
+			gen_shunt_list "${node}" shunt_list4 shunt_list6
+			unset SHUNT_PRESERVE_SETS
+		fi
 		[ -n "${use}" ] && local dns_redirect_port=$(get_cache_var "ACL_${use}_dns_port")
 
 		[ "${local_proxy}" = "1" ] && {
@@ -683,45 +859,8 @@ mwan3_start() {
 		logger -t passwall2 "mwan3: failed to add ${FWMARK} exemption rule to mangle/mwan3_hook"
 }
 
-update_wan_sets() {
-	[ -z "$(command -v get_wan_ips)" ] && . "$UTILS_PATH"
-
-	(
-		flock -x 9 || exit 1
-
-		local WAN_IP=$(get_wan_ips ip4)
-		[ -n "$WAN_IP" ] && {
-			# nft flush set $NFTABLE_NAME $NFTSET_WAN
-			echo "$WAN_IP" | insert_nftset $NFTSET_WAN "-1"
-		}
-
-		local WAN6_IP=$(get_wan_ips ip6)
-		[ -n "${WAN6_IP}" ] && {
-			# nft flush set $NFTABLE_NAME $NFTSET_WAN6
-			echo "$WAN6_IP" | insert_nftset $NFTSET_WAN6 "-1"
-		}
-	) 9>"${LOCK_PATH}/${CONFIG}_update_wan_sets.lock"
-}
-
-add_firewall_rule() {
-	log_i18n 0 "Starting to load %s firewall rules..." "nftables"
-	gen_nft_tables
-	add_script_mwan3
-	mwan3_start
-
-	gen_nftset $NFTSET_LOCAL ipv4_addr 0 "-1"
-	gen_nftset $NFTSET_DIRECT ipv4_addr 0 "-1"
-	gen_nftset $NFTSET_VPS ipv4_addr 0 "-1"
-	gen_nftset $NFTSET_WAN ipv4_addr 0 "-1"
-
-	gen_nftset $NFTSET_LOCAL6 ipv6_addr 0 "-1"
-	gen_nftset $NFTSET_DIRECT6 ipv6_addr 0 "-1"
-	gen_nftset $NFTSET_VPS6 ipv6_addr 0 "-1"
-	gen_nftset $NFTSET_WAN6 ipv6_addr 0 "-1"
-
-	get_local_ips ip4 | insert_nftset $NFTSET_LOCAL "-1"
-	get_local_ips ip6 | insert_nftset $NFTSET_LOCAL6 "-1"
-
+# 直连集合的内容：direct_ip（含 geoip 代码）、LAN 网段与 ISP DNS。启动时直接写入，热刷新时写入同一事务。
+fill_direct_sets() {
 	for ip in $(cat /usr/share/passwall2/direct_ip | tr -s "\r\n" "\n" | grep -v "^#" | sed -e "/^$/d"); do
 		if [[ "$ip" == *::* ]]; then
 			echo "$ip" | insert_nftset $NFTSET_DIRECT6 "-1"
@@ -747,28 +886,76 @@ add_firewall_rule() {
 		[ -n "$lan_ip6" ] && echo $lan_ip6 | insert_nftset $NFTSET_DIRECT6 "-1"
 	}
 
-	update_wan_sets
-
 	[ -n "$ISP_DNS" ] && {
 		echo "$ISP_DNS" | insert_nftset $NFTSET_DIRECT "-1"
-		for ispip in $ISP_DNS; do
+		[ -z "${NFT_SCRIPT}" ] && for ispip in $ISP_DNS; do
 			log_i18n 1 "$(i18n "Add ISP %s DNS to the whitelist: %s" "IPv4" "${ispip}")"
 		done
 	}
 
 	[ -n "$ISP_DNS6" ] && {
 		echo $ISP_DNS6 | insert_nftset $NFTSET_DIRECT6 "-1"
-		for ispip6 in $ISP_DNS6; do
+		[ -z "${NFT_SCRIPT}" ] && for ispip6 in $ISP_DNS6; do
 			log_i18n 1 "$(i18n "Add ISP %s DNS to the whitelist: %s" "IPv6" "${ispip6}")"
 		done
 	}
+	return 0
+}
+
+update_wan_sets() {
+	[ -z "$(command -v get_wan_ips)" ] && . "$UTILS_PATH"
+
+	(
+		flock -x 9 || exit 1
+
+		local WAN_IP=$(get_wan_ips ip4)
+		[ -n "$WAN_IP" ] && {
+			# nft flush set $NFTABLE_NAME $NFTSET_WAN
+			echo "$WAN_IP" | insert_nftset $NFTSET_WAN "-1"
+		}
+
+		local WAN6_IP=$(get_wan_ips ip6)
+		[ -n "${WAN6_IP}" ] && {
+			# nft flush set $NFTABLE_NAME $NFTSET_WAN6
+			echo "$WAN6_IP" | insert_nftset $NFTSET_WAN6 "-1"
+		}
+	) 9>"${LOCK_PATH}/${CONFIG}_update_wan_sets.lock"
+}
+
+add_firewall_rule() {
+	log_i18n 0 "Starting to load %s firewall rules..." "nftables"
+	gen_nft_tables
+	# 影子启动不触碰其它程序的规则；提交后由热重载补做。
+	[ -z "${PW2_STAGE}" ] && {
+		add_script_mwan3
+		mwan3_start
+	}
+
+	gen_nftset $NFTSET_LOCAL ipv4_addr 0 "-1"
+	gen_nftset $NFTSET_DIRECT ipv4_addr 0 "-1"
+	gen_nftset $NFTSET_VPS ipv4_addr 0 "-1"
+	gen_nftset $NFTSET_WAN ipv4_addr 0 "-1"
+
+	gen_nftset $NFTSET_LOCAL6 ipv6_addr 0 "-1"
+	gen_nftset $NFTSET_DIRECT6 ipv6_addr 0 "-1"
+	gen_nftset $NFTSET_VPS6 ipv6_addr 0 "-1"
+	gen_nftset $NFTSET_WAN6 ipv6_addr 0 "-1"
+
+	get_local_ips ip4 | insert_nftset $NFTSET_LOCAL "-1"
+	get_local_ips ip6 | insert_nftset $NFTSET_LOCAL6 "-1"
+
+	fill_direct_sets
+	update_wan_sets
 
 	# Filter all node IPs
-	filter_vpsip > /dev/null 2>&1 &
-	filter_haproxy > /dev/null 2>&1 &
-	# Prevent some conditions
-	filter_vps_addr $(config_n_get $NODE address) > /dev/null 2>&1 &
-	filter_vps_addr $(config_n_get $NODE download_address) > /dev/null 2>&1 &
+	# psw2_vps 只增不减（前置 DNS 也会写入）：影子启动不生成，提交后在正式表中照常补充。
+	[ -z "${PW2_STAGE}" ] && {
+		filter_vpsip > /dev/null 2>&1 &
+		filter_haproxy > /dev/null 2>&1 &
+		# Prevent some conditions
+		filter_vps_addr $(config_n_get $NODE address) > /dev/null 2>&1 &
+		filter_vps_addr $(config_n_get $NODE download_address) > /dev/null 2>&1 &
+	}
 
 	accept_icmp=$(config_n_get @global_forwarding[0] accept_icmp 0)
 	accept_icmpv6=$(config_n_get @global_forwarding[0] accept_icmpv6 0)
@@ -802,6 +989,21 @@ add_firewall_rule() {
 	nft "add rule $NFTABLE_NAME PSW2_RULE tcp flags & (fin|syn|rst|ack) == syn counter meta mark set ${FWMARK}"
 	nft "add rule $NFTABLE_NAME PSW2_RULE meta l4proto udp ct state { new, related } counter meta mark set ${FWMARK}"
 	nft "add rule $NFTABLE_NAME PSW2_RULE counter ct mark set mark"
+
+	# 先启动各实例（核心、前置 DNS、直连写集合 DNS）：默认实例的分流子链要包含启动时登记的直连写集合，
+	# 且生成器在分流规则变化时清空集合的动作必须发生在集合填充之前。
+	log_i18n 1 "Access Control:"
+	acl_node
+	ACL_NODE_DONE=1
+
+	# 默认实例的分流子链；热切换全局节点时整体原子替换。须在 PSW2_RULE 之后、主链跳转之前创建。
+	local default_redir_port=$(sed -n 's/^redir_port="\(.*\)"$/\1/p' ${TMP_ACL_PATH}/acl_default/var 2>/dev/null)
+	unset SHUNT_LIST4 SHUNT_LIST6
+	[ -n "${default_redir_port}" ] && [ -n "${NODE}" ] && gen_shunt_list "${NODE}" SHUNT_LIST4 SHUNT_LIST6
+	for chain in ${SHUNT_CHAINS}; do
+		nft "add chain $NFTABLE_NAME ${chain}"
+	done
+	gen_shunt_chains "${default_redir_port}" | nft -f -
 
 	#ipv4 tproxy mode and udp
 	nft "add chain $NFTABLE_NAME PSW2_MANGLE"
@@ -854,8 +1056,10 @@ add_firewall_rule() {
 	[ -z "${is_tproxy}" ] && nft "add rule $NFTABLE_NAME PSW2_NAT ip daddr @$NFTSET_WAN counter return comment \"WAN_IP_RETURN\""
 	nft "add rule $NFTABLE_NAME PSW2_MANGLE ip daddr @$NFTSET_WAN counter return comment \"WAN_IP_RETURN\""
 
-	ip rule add fwmark ${FWMARK} table 999 priority 999
-	ip route add local 0.0.0.0/0 dev lo table 999
+	[ -z "${PW2_STAGE}" ] && {
+		ip rule add fwmark ${FWMARK} table 999 priority 999
+		ip route add local 0.0.0.0/0 dev lo table 999
+	}
 
 	#ipv6 tproxy mode and udp
 	nft "add chain $NFTABLE_NAME PSW2_MANGLE_V6"
@@ -894,13 +1098,20 @@ add_firewall_rule() {
 		nft "add rule $NFTABLE_NAME mangle_output ip6 daddr != @$NFTSET_DIRECT6 meta nfproto {ipv6} counter jump PSW2_OUTPUT_MANGLE_V6 comment \"PSW2_OUTPUT_MANGLE\""
 		nft "add rule $NFTABLE_NAME PSW2_MANGLE_V6 ip6 daddr @$NFTSET_WAN6 counter return comment \"WAN6_IP_RETURN\""
 
-		ip -6 rule add fwmark ${FWMARK} table 999 priority 999
-		ip -6 route add local ::/0 dev lo table 999
+		[ -z "${PW2_STAGE}" ] && {
+			ip -6 rule add fwmark ${FWMARK} table 999 priority 999
+			ip -6 route add local ::/0 dev lo table 999
+		}
 	}
 
 	load_acl
 
-	filter_direct_node_list > /dev/null 2>&1 &
+	# 影子启动同步生成直连节点的放行规则，使目标规则集完整。
+	if [ -n "${PW2_STAGE}" ]; then
+		filter_direct_node_list > /dev/null 2>&1
+	else
+		filter_direct_node_list > /dev/null 2>&1 &
+	fi
 
 	log_i18n 0 "%s firewall rules load complete!" "nftables"
 }
@@ -913,7 +1124,12 @@ del_firewall_rule() {
 		done
 	done
 
-	for handle in $(nft -a list chains | grep -E "chain PSW2_" | grep -v "PSW2_RULE" | awk -F '# handle ' '{print$2}'); do
+	for handle in $(nft -a list chains | grep -E "chain PSW2_" | grep -v -E "PSW2_RULE|PSW2_SHUNT_" | awk -F '# handle ' '{print$2}'); do
+		nft delete chain $NFTABLE_NAME handle ${handle} 2>/dev/null
+	done
+
+	# 分流子链被上面的主链引用，又会跳转到 PSW2_RULE，须在两者之间删除。
+	for handle in $(nft -a list chains | grep -E "chain PSW2_SHUNT_" | awk -F '# handle ' '{print$2}'); do
 		nft delete chain $NFTABLE_NAME handle ${handle} 2>/dev/null
 	done
 
@@ -982,7 +1198,7 @@ gen_include() {
 start() {
 	[ "$ENABLED_DEFAULT_ACL" == 0 -a "$ENABLED_ACLS" == 0 ] && return
 	add_firewall_rule
-	gen_include
+	[ -z "${PW2_STAGE}" ] && gen_include
 }
 
 stop() {
@@ -1006,7 +1222,25 @@ insert_nftset)
 	insert_nftset "$@"
 	;;
 filter_direct_node_list)
+	[ -z "$(command -v config_n_get)" ] && . "$UTILS_PATH"
+	# 直接调用（热重载、Socks 节点切换）时没有启动阶段的变量：按当前 TCP 转发方式确定本机输出链。
+	[ -n "${nft_output_chain}" ] || {
+		if [ "$(config_n_get @global_forwarding[0] tcp_proxy_way redirect)" = "tproxy" ]; then
+			is_tproxy="TPROXY"
+			nft_output_chain="PSW2_OUTPUT_MANGLE"
+		else
+			nft_output_chain="PSW2_OUTPUT_NAT"
+		fi
+	}
 	filter_direct_node_list
+	;;
+filter_vpsip)
+	[ -z "$(command -v config_n_get)" ] && . "$UTILS_PATH"
+	filter_vpsip
+	;;
+filter_vps_addr)
+	[ -z "$(command -v config_n_get)" ] && . "$UTILS_PATH"
+	filter_vps_addr "$@"
 	;;
 mwan3_start)
 	mwan3_start
@@ -1016,6 +1250,28 @@ mwan3_stop)
 	;;
 update_wan_sets)
 	update_wan_sets "$@"
+	;;
+shunt_ready)
+	shunt_ready
+	;;
+shunt_switch)
+	shunt_switch "$@"
+	;;
+refresh_sets)
+	refresh_sets "$@"
+	;;
+post_reconcile)
+	# 差量热重载提交防火墙事务之后：恢复与其它程序的协作（mwan3）并重写防火墙重载时的恢复脚本。
+	[ -z "$(command -v log_i18n)" ] && . "$UTILS_PATH"
+	add_script_mwan3
+	mwan3_start
+	gen_include
+	;;
+clear)
+	# 差量热重载的目标状态不再需要透明代理规则：只删除规则，不处理 flush_set。
+	[ -z "$(command -v log_i18n)" ] && . "$UTILS_PATH"
+	del_firewall_rule
+	flush_include
 	;;
 stop)
 	stop

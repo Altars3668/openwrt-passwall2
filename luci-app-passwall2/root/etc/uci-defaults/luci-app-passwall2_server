@@ -9,6 +9,8 @@ if [ -e "/etc/config/ucitrack" ]; then
 EOF
 fi
 
+lua /usr/lib/lua/luci/passwall2/server_app.lua migrate >/dev/null 2>&1
+
 rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
 rm -rf /tmp/luci-modulecache/
 killall -HUP rpcd 2>/dev/null

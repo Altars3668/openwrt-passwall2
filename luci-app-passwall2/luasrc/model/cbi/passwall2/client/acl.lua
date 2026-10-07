@@ -55,6 +55,8 @@ o.cfgvalue = function(self, section)
 	if type(v) == "table" then
 		return table.concat(v, "<br/>")
 	end
+	-- 旧版本保存的单个选项
+	return (v:gsub("%s+", "<br/>"))
 end
 
 i = s:option(DummyValue, "mode", translate("Mode"))

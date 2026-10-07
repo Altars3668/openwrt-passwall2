@@ -1,0 +1,1491 @@
+diff --git a/app/proxyman/command/command.go b/app/proxyman/command/command.go
+index 217b2b4..761c0fd 100644
+--- a/app/proxyman/command/command.go
++++ b/app/proxyman/command/command.go
+@@ -163,14 +163,24 @@ func (s *handlerServer) GetInboundUsersCount(ctx context.Context, request *GetIn
+ }
+ 
+ func (s *handlerServer) AddOutbound(ctx context.Context, request *AddOutboundRequest) (*AddOutboundResponse, error) {
+-	if err := core.AddOutboundHandler(s.s, request.Outbound); err != nil {
++	instance, release := s.s.AcquireActiveRuntime()
++	defer release()
++	if instance == nil {
++		return nil, errors.New("runtime closed")
++	}
++	if err := core.AddOutboundHandler(instance, request.Outbound); err != nil {
+ 		return nil, err
+ 	}
+ 	return &AddOutboundResponse{}, nil
+ }
+ 
+ func (s *handlerServer) RemoveOutbound(ctx context.Context, request *RemoveOutboundRequest) (*RemoveOutboundResponse, error) {
+-	return &RemoveOutboundResponse{}, s.ohm.RemoveHandler(ctx, request.Tag)
++	instance, release := s.s.AcquireActiveRuntime()
++	defer release()
++	if instance == nil {
++		return nil, errors.New("runtime closed")
++	}
++	return &RemoveOutboundResponse{}, instance.GetFeature(outbound.ManagerType()).(outbound.Manager).RemoveHandler(ctx, request.Tag)
+ }
+ 
+ func (s *handlerServer) AlterOutbound(ctx context.Context, request *AlterOutboundRequest) (*AlterOutboundResponse, error) {
+@@ -183,12 +193,25 @@ func (s *handlerServer) AlterOutbound(ctx context.Context, request *AlterOutboun
+ 		return nil, errors.New("not an outbound operation")
+ 	}
+ 
+-	handler := s.ohm.GetHandler(request.Tag)
++	instance, release := s.s.AcquireActiveRuntime()
++	defer release()
++	if instance == nil {
++		return nil, errors.New("runtime closed")
++	}
++	handler := instance.GetFeature(outbound.ManagerType()).(outbound.Manager).GetHandler(request.Tag)
++	if handler == nil {
++		return nil, errors.New("outbound not found")
++	}
+ 	return &AlterOutboundResponse{}, operation.ApplyOutbound(ctx, handler)
+ }
+ 
+ func (s *handlerServer) ListOutbounds(ctx context.Context, request *ListOutboundsRequest) (*ListOutboundsResponse, error) {
+-	handlers := s.ohm.ListHandlers(ctx)
++	instance, release := s.s.AcquireActiveRuntime()
++	defer release()
++	if instance == nil {
++		return nil, errors.New("runtime closed")
++	}
++	handlers := instance.GetFeature(outbound.ManagerType()).(outbound.Manager).ListHandlers(ctx)
+ 	response := &ListOutboundsResponse{}
+ 	for _, handler := range handlers {
+ 		// Ignore gRPC outbound
+@@ -219,6 +242,7 @@ func (s *service) Register(server *grpc.Server) {
+ 		hs.ohm = om
+ 	}, false))
+ 	RegisterHandlerServiceServer(server, hs)
++	registerConfigReload(server, s.v)
+ 
+ 	// For compatibility purposes
+ 	vCoreDesc := HandlerService_ServiceDesc
+diff --git a/app/proxyman/outbound/handler.go b/app/proxyman/outbound/handler.go
+index fe43c42..74b459a 100644
+--- a/app/proxyman/outbound/handler.go
++++ b/app/proxyman/outbound/handler.go
+@@ -184,7 +184,7 @@ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
+ 		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
+ 			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
+ 		}
+-		ips, err := internet.LookupForIP(ob.Target.Address.Domain(), strategy, nil)
++		ips, err := internet.LookupForIPContext(ctx, ob.Target.Address.Domain(), strategy, nil)
+ 		if err != nil {
+ 			errors.LogInfoInner(ctx, err, "failed to resolve ip for target ", ob.Target.Address.Domain())
+ 			if h.senderSettings.TargetStrategy.ForceIP() {
+diff --git a/app/router/command/command.go b/app/router/command/command.go
+index 8274d3b..8730894 100644
+--- a/app/router/command/command.go
++++ b/app/router/command/command.go
+@@ -16,12 +16,29 @@ import (
+ type routingServer struct {
+ 	router       routing.Router
+ 	routingStats stats.Channel
++	instance     *core.Instance
++}
++
++func (s *routingServer) activeRouter() (routing.Router, func(), error) {
++	if s.instance == nil {
++		return s.router, func() {}, nil
++	}
++	instance, release := s.instance.AcquireActiveRuntime()
++	if instance == nil {
++		return nil, release, errors.New("runtime closed")
++	}
++	return instance.GetFeature(routing.RouterType()).(routing.Router), release, nil
+ }
+ 
+ func (s *routingServer) GetBalancerInfo(ctx context.Context, request *GetBalancerInfoRequest) (*GetBalancerInfoResponse, error) {
+ 	var ret GetBalancerInfoResponse
+ 	ret.Balancer = &BalancerMsg{}
+-	if bo, ok := s.router.(routing.BalancerOverrider); ok {
++	router, release, err := s.activeRouter()
++	defer release()
++	if err != nil {
++		return nil, err
++	}
++	if bo, ok := router.(routing.BalancerOverrider); ok {
+ 		{
+ 			res, err := bo.GetOverrideTarget(request.GetTag())
+ 			if err != nil {
+@@ -33,7 +50,7 @@ func (s *routingServer) GetBalancerInfo(ctx context.Context, request *GetBalance
+ 		}
+ 	}
+ 
+-	if pt, ok := s.router.(routing.BalancerPrincipleTarget); ok {
++	if pt, ok := router.(routing.BalancerPrincipleTarget); ok {
+ 		{
+ 			res, err := pt.GetPrincipleTarget(request.GetTag())
+ 			if err != nil {
+@@ -47,28 +64,48 @@ func (s *routingServer) GetBalancerInfo(ctx context.Context, request *GetBalance
+ }
+ 
+ func (s *routingServer) OverrideBalancerTarget(ctx context.Context, request *OverrideBalancerTargetRequest) (*OverrideBalancerTargetResponse, error) {
+-	if bo, ok := s.router.(routing.BalancerOverrider); ok {
++	router, release, err := s.activeRouter()
++	defer release()
++	if err != nil {
++		return nil, err
++	}
++	if bo, ok := router.(routing.BalancerOverrider); ok {
+ 		return &OverrideBalancerTargetResponse{}, bo.SetOverrideTarget(request.BalancerTag, request.Target)
+ 	}
+ 	return nil, errors.New("unsupported router implementation")
+ }
+ 
+ func (s *routingServer) AddRule(ctx context.Context, request *AddRuleRequest) (*AddRuleResponse, error) {
+-	if bo, ok := s.router.(routing.Router); ok {
++	router, release, err := s.activeRouter()
++	defer release()
++	if err != nil {
++		return nil, err
++	}
++	if bo, ok := router.(routing.Router); ok {
+ 		return &AddRuleResponse{}, bo.AddRule(request.Config, request.ShouldAppend)
+ 	}
+ 	return nil, errors.New("unsupported router implementation")
+ }
+ 
+ func (s *routingServer) RemoveRule(ctx context.Context, request *RemoveRuleRequest) (*RemoveRuleResponse, error) {
+-	if bo, ok := s.router.(routing.Router); ok {
++	router, release, err := s.activeRouter()
++	defer release()
++	if err != nil {
++		return nil, err
++	}
++	if bo, ok := router.(routing.Router); ok {
+ 		return &RemoveRuleResponse{}, bo.RemoveRule(request.RuleTag)
+ 	}
+ 	return nil, errors.New("unsupported router implementation")
+ }
+ 
+ func (s *routingServer) ListRule(ctx context.Context, request *ListRuleRequest) (*ListRuleResponse, error) {
+-	if bo, ok := s.router.(routing.Router); ok {
++	router, release, err := s.activeRouter()
++	defer release()
++	if err != nil {
++		return nil, err
++	}
++	if bo, ok := router.(routing.Router); ok {
+ 		response := &ListRuleResponse{}
+ 		for _, v := range bo.ListRule() {
+ 			response.Rules = append(response.Rules, &ListRuleItem{
+@@ -93,7 +130,12 @@ func (s *routingServer) TestRoute(ctx context.Context, request *TestRouteRequest
+ 	if request.RoutingContext == nil {
+ 		return nil, errors.New("Invalid routing request.")
+ 	}
+-	route, err := s.router.PickRoute(AsRoutingContext(request.RoutingContext))
++	router, release, err := s.activeRouter()
++	defer release()
++	if err != nil {
++		return nil, err
++	}
++	route, err := router.PickRoute(AsRoutingContext(request.RoutingContext))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -142,7 +184,7 @@ type service struct {
+ 
+ func (s *service) Register(server *grpc.Server) {
+ 	common.Must(s.v.RequireFeatures(func(router routing.Router, stats stats.Manager) {
+-		rs := NewRoutingServer(router, nil)
++		rs := &routingServer{router: router, instance: s.v}
+ 		RegisterRoutingServiceServer(server, rs)
+ 
+ 		// For compatibility purposes
+diff --git a/core/xray.go b/core/xray.go
+index a705070..bcb57e9 100644
+--- a/core/xray.go
++++ b/core/xray.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"reflect"
+ 	"sync"
++	"sync/atomic"
+ 
+ 	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/common/errors"
+@@ -18,6 +19,7 @@ import (
+ 	"github.com/xtls/xray-core/features/routing"
+ 	"github.com/xtls/xray-core/features/stats"
+ 	"github.com/xtls/xray-core/transport/internet"
++	"google.golang.org/protobuf/proto"
+ )
+ 
+ // Server is an instance of Xray. At any time, there must be at most one Server instance running.
+@@ -87,7 +89,10 @@ type Instance struct {
+ 	running                    bool
+ 	resolveLock                sync.Mutex
+ 
+-	ctx context.Context
++	ctx           context.Context
++	reloader      *configReloader
++	reloadStaging bool
++	started       atomic.Bool
+ }
+ 
+ // Instance state
+@@ -187,8 +192,10 @@ func NewWithContext(ctx context.Context, config *Config) (*Instance, error) {
+ }
+ 
+ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
+-	if err := platform.ReloadEnvSettings(); err != nil {
+-		return true, errors.New("failed to reload environment settings").Base(err)
++	if !server.reloadStaging {
++		if err := platform.ReloadEnvSettings(); err != nil {
++			return true, errors.New("failed to reload environment settings").Base(err)
++		}
+ 	}
+ 	server.ctx = context.WithValue(server.ctx, "cone",
+ 		platform.NewEnvFlag(platform.UseCone).GetValue(func() string { return "" }) != "true")
+@@ -203,6 +210,10 @@ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
+ 			return true, err
+ 		}
+ 		if feature, ok := obj.(features.Feature); ok {
++			if dispatcher, ok := feature.(routing.Dispatcher); ok && !server.reloadStaging {
++				server.reloader = newConfigReloader(server, dispatcher)
++				feature = &runtimeDispatcher{Dispatcher: dispatcher, reload: server.reloader}
++			}
+ 			if err := server.AddFeature(feature); err != nil {
+ 				return true, err
+ 			}
+@@ -227,13 +238,16 @@ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
+ 		}
+ 	}
+ 
+-	internet.InitSystemDialer(
+-		server.GetFeature(dns.ClientType()).(dns.Client),
+-		func() outbound.Manager {
+-			obm, _ := server.GetFeature(outbound.ManagerType()).(outbound.Manager)
+-			return obm
+-		}(),
+-	)
++	if !server.reloadStaging {
++		internet.InitSystemDialer(
++			server.GetFeature(dns.ClientType()).(dns.Client),
++			func() outbound.Manager {
++				obm, _ := server.GetFeature(outbound.ManagerType()).(outbound.Manager)
++				return obm
++			}(),
++		)
++	}
++	server.ctx = server.dialerContext(server.ctx)
+ 
+ 	server.resolveLock.Lock()
+ 	if server.pendingResolutions != nil {
+@@ -249,6 +263,9 @@ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
+ 	if err := addOutboundHandlers(server, config.Outbound); err != nil {
+ 		return true, err
+ 	}
++	if server.reloader != nil {
++		server.reloader.current.config = proto.Clone(config).(*Config)
++	}
+ 	return false, nil
+ }
+ 
+@@ -259,6 +276,10 @@ func (s *Instance) Type() interface{} {
+ 
+ // Close shutdown the Xray instance.
+ func (s *Instance) Close() error {
++	s.started.Store(false)
++	if s.reloader != nil {
++		s.reloader.close()
++	}
+ 	s.statusLock.Lock()
+ 	defer s.statusLock.Unlock()
+ 
+@@ -396,6 +417,7 @@ func (s *Instance) Start() error {
+ 	}
+ 
+ 	errors.LogWarning(s.ctx, "Xray ", Version(), " started")
++	s.started.Store(true)
+ 
+ 	return nil
+ }
+diff --git a/main/commands/all/api/api.go b/main/commands/all/api/api.go
+index 85d7aa9..114082e 100644
+--- a/main/commands/all/api/api.go
++++ b/main/commands/all/api/api.go
+@@ -12,6 +12,7 @@ var CmdAPI = &base.Command{
+ `,
+ 	Commands: []*base.Command{
+ 		cmdRestartLogger,
++		cmdReloadConfig,
+ 		cmdGetStats,
+ 		cmdQueryStats,
+ 		cmdSysStats,
+diff --git a/proxy/freedom/freedom.go b/proxy/freedom/freedom.go
+index 5997359..8d3f6ae 100644
+--- a/proxy/freedom/freedom.go
++++ b/proxy/freedom/freedom.go
+@@ -294,7 +294,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
+ 		if destination.Address.Family().IsDomain() {
+ 			if defaultRule != nil || len(h.finalRules) > 0 {
+ 				if strategy := h.resolveStrategy; strategy.HasStrategy() {
+-					ips, err := internet.LookupForIP(destination.Address.Domain(), strategy, outGateway)
++					ips, err := internet.LookupForIPContext(ctx, destination.Address.Domain(), strategy, outGateway)
+ 					if err != nil { // non-force may still dial with system DNS
+ 						errors.LogInfoInner(ctx, err, "failed to get IP address for domain ", destination.Address.Domain())
+ 						if strategy.ForceIP() {
+@@ -403,7 +403,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
+ 				writer = buf.NewWriter(conn)
+ 			}
+ 		} else {
+-			writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
++			writer = NewPacketWriterWithContext(ctx, conn, h, defaultRule, UDPOverride, destination, outGateway)
+ 			if h.config.Noises != nil {
+ 				errors.LogDebug(ctx, "NOISE", h.config.Noises)
+ 				writer = &NoisePacketWriter{
+@@ -533,6 +533,10 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+ 
+ // DialDest means the dial target used in the dialer when creating conn
+ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverride net.Destination, DialDest net.Destination, outGateway net.Address) buf.Writer {
++	return NewPacketWriterWithContext(context.Background(), conn, h, defaultRule, UDPOverride, DialDest, outGateway)
++}
++
++func NewPacketWriterWithContext(ctx context.Context, conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverride net.Destination, DialDest net.Destination, outGateway net.Address) buf.Writer {
+ 	iConn := conn
+ 	statConn, ok := iConn.(*stat.CounterConnection)
+ 	if ok {
+@@ -550,6 +554,7 @@ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
+ 			resolvedUDPAddr.Store(DialDest.Address.Domain(), net.DestinationFromAddr(conn.RemoteAddr()).Address)
+ 		}
+ 		return &PacketWriter{
++			ctx:               ctx,
+ 			PacketConnWrapper: c,
+ 			Counter:           counter,
+ 			Handler:           h,
+@@ -563,6 +568,7 @@ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
+ }
+ 
+ type PacketWriter struct {
++	ctx context.Context
+ 	*net.PacketConnWrapper
+ 	stats.Counter
+ 	*Handler
+@@ -599,7 +605,7 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+ 				} else {
+ 					shouldUseSystemResolver := true
+ 					if strategy := w.Handler.resolveStrategy; strategy.HasStrategy() {
+-						ips, err := internet.LookupForIP(b.UDP.Address.Domain(), strategy, w.OutGateway)
++						ips, err := internet.LookupForIPContext(w.ctx, b.UDP.Address.Domain(), strategy, w.OutGateway)
+ 						if err != nil {
+ 							// drop packet if resolve failed when forceIP
+ 							if strategy.ForceIP() {
+diff --git a/transport/internet/dialer.go b/transport/internet/dialer.go
+index 6d7b905..90392bd 100644
+--- a/transport/internet/dialer.go
++++ b/transport/internet/dialer.go
+@@ -85,6 +85,11 @@ var (
+ )
+ 
+ func LookupForIP(domain string, strategy DomainStrategy, localAddr net.Address) ([]net.IP, error) {
++	return LookupForIPContext(context.Background(), domain, strategy, localAddr)
++}
++
++func LookupForIPContext(ctx context.Context, domain string, strategy DomainStrategy, localAddr net.Address) ([]net.IP, error) {
++	dnsClient := stateForDialer(ctx).dns
+ 	if dnsClient == nil {
+ 		return nil, errors.New("DNS client not initialized")
+ 	}
+@@ -253,7 +258,7 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
+ 		if outboundName == "freedom" && dest.Network == net.Network_UDP && origTargetAddr != nil && src == nil {
+ 			finalStrategy = finalStrategy.GetDynamicStrategy(origTargetAddr.Family())
+ 		}
+-		ips, err := LookupForIP(dest.Address.Domain(), finalStrategy, src)
++		ips, err := LookupForIPContext(ctx, dest.Address.Domain(), finalStrategy, src)
+ 		if err != nil {
+ 			errors.LogErrorInner(ctx, err, "failed to resolve ip")
+ 			if sockopt.DomainStrategy.ForceIP() {
+@@ -268,6 +273,7 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
+ 	}
+ 
+ 	if len(sockopt.DialerProxy) > 0 {
++		obm := stateForDialer(ctx).outbound
+ 		if obm == nil {
+ 			return nil, errors.New("there is no outbound manager for dialerProxy")
+ 		}
+diff --git a/app/proxyman/command/config_reload.go b/app/proxyman/command/config_reload.go
+new file mode 100644
+index 0000000..7e91717
+--- /dev/null
++++ b/app/proxyman/command/config_reload.go
+@@ -0,0 +1,132 @@
++package command
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"net"
++	"os"
++	"strings"
++
++	"github.com/xtls/xray-core/common/geodata"
++	"github.com/xtls/xray-core/core"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/peer"
++	"google.golang.org/grpc/status"
++	"google.golang.org/protobuf/types/known/wrapperspb"
++)
++
++const (
++	ConfigReloadMethod        = "/xray.app.proxyman.command.ConfigReloadService/Reload"
++	ConfigReloadGeodataMethod = "/xray.app.proxyman.command.ConfigReloadService/ReloadGeodata"
++)
++
++type configReloadServer interface {
++	Reload(context.Context, *wrapperspb.BytesValue) (*wrapperspb.Int32Value, error)
++	ReloadGeodata(context.Context, *wrapperspb.BytesValue) (*wrapperspb.Int32Value, error)
++}
++
++type configReloadService struct{ instance *core.Instance }
++
++func requireLoopback(ctx context.Context) error {
++	remote, ok := peer.FromContext(ctx)
++	if !ok {
++		return status.Error(codes.PermissionDenied, "loopback API required")
++	}
++	address, ok := remote.Addr.(*net.TCPAddr)
++	if !ok || !address.IP.IsLoopback() {
++		return status.Error(codes.PermissionDenied, "loopback API required")
++	}
++	return nil
++}
++
++// ReloadGeodata 重新读取 geoip/geosite 数据文件，并原地重建所有已登记的匹配器（包括仍在排空的旧运行实例）。
++// 匹配器按“文件:代码”缓存，只重载配置会沿用旧数据；每个登记表先全部构建成功才替换，失败时保持原数据。
++func (s *configReloadService) ReloadGeodata(ctx context.Context, _ *wrapperspb.BytesValue) (*wrapperspb.Int32Value, error) {
++	if err := requireLoopback(ctx); err != nil {
++		return nil, err
++	}
++	if err := errors.Join(geodata.IPReg.Reload(), geodata.DomainReg.Reload()); err != nil {
++		return nil, status.Error(codes.InvalidArgument, err.Error())
++	}
++	return wrapperspb.Int32(1), nil
++}
++
++func (s *configReloadService) Reload(ctx context.Context, request *wrapperspb.BytesValue) (*wrapperspb.Int32Value, error) {
++	if err := requireLoopback(ctx); err != nil {
++		return nil, err
++	}
++	if len(request.Value) == 0 {
++		return wrapperspb.Int32(1), nil
++	}
++	if len(request.Value) > 4<<20 {
++		return nil, status.Error(codes.ResourceExhausted, "configuration too large")
++	}
++	var fields map[string]json.RawMessage
++	if err := json.Unmarshal(request.Value, &fields); err != nil {
++		return nil, status.Error(codes.InvalidArgument, "invalid configuration")
++	}
++	// Build 会把 env 写入进程环境：只接受与当前进程环境完全一致的 env（写入等于无操作），
++	// 真正的环境变化必须在调用配置加载器之前拒绝。
++	for key, raw := range fields {
++		if !strings.EqualFold(key, "env") {
++			continue
++		}
++		var env map[string]string
++		if err := json.Unmarshal(raw, &env); err != nil {
++			return nil, status.Error(codes.InvalidArgument, "invalid env configuration")
++		}
++		for name, value := range env {
++			if current, ok := os.LookupEnv(name); !ok || current != value {
++				return nil, status.Error(codes.FailedPrecondition, core.ErrHotReloadUnsupported.Error()+": env "+name+" changed")
++			}
++		}
++	}
++	config, err := core.LoadConfig("json", bytes.NewReader(request.Value))
++	if err != nil {
++		return nil, status.Error(codes.InvalidArgument, "invalid configuration")
++	}
++	if err = s.instance.ReloadConfig(ctx, config); err != nil {
++		code := codes.InvalidArgument
++		if errors.Is(err, core.ErrHotReloadUnsupported) {
++			code = codes.FailedPrecondition
++		} else if ctx.Err() != nil {
++			return nil, status.FromContextError(ctx.Err()).Err()
++		}
++		// 只经本机回环接口返回给调用者，保留原因便于定位。
++		return nil, status.Error(code, err.Error())
++	}
++	return wrapperspb.Int32(1), nil
++}
++
++func reloadMethod(name, fullMethod string, call func(configReloadServer, context.Context, *wrapperspb.BytesValue) (*wrapperspb.Int32Value, error)) grpc.MethodDesc {
++	return grpc.MethodDesc{
++		MethodName: name,
++		Handler: func(srv interface{}, ctx context.Context, decode func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++			request := new(wrapperspb.BytesValue)
++			if err := decode(request); err != nil {
++				return nil, err
++			}
++			if interceptor == nil {
++				return call(srv.(configReloadServer), ctx, request)
++			}
++			info := &grpc.UnaryServerInfo{Server: srv, FullMethod: fullMethod}
++			return interceptor(ctx, request, info, func(ctx context.Context, request interface{}) (interface{}, error) {
++				return call(srv.(configReloadServer), ctx, request.(*wrapperspb.BytesValue))
++			})
++		},
++	}
++}
++
++func registerConfigReload(server *grpc.Server, instance *core.Instance) {
++	server.RegisterService(&grpc.ServiceDesc{
++		ServiceName: "xray.app.proxyman.command.ConfigReloadService",
++		HandlerType: (*configReloadServer)(nil),
++		Methods: []grpc.MethodDesc{
++			reloadMethod("Reload", ConfigReloadMethod, configReloadServer.Reload),
++			reloadMethod("ReloadGeodata", ConfigReloadGeodataMethod, configReloadServer.ReloadGeodata),
++		},
++	}, &configReloadService{instance: instance})
++}
+diff --git a/app/proxyman/command/config_reload_geodata_test.go b/app/proxyman/command/config_reload_geodata_test.go
+new file mode 100644
+index 0000000..b42dcf3
+--- /dev/null
++++ b/app/proxyman/command/config_reload_geodata_test.go
+@@ -0,0 +1,94 @@
++package command
++
++import (
++	"context"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/xtls/xray-core/common/geodata"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/peer"
++	"google.golang.org/grpc/status"
++	"google.golang.org/protobuf/proto"
++)
++
++func writeTestGeoSite(t *testing.T, dir, domain string) {
++	t.Helper()
++	list := &geodata.GeoSiteList{Entry: []*geodata.GeoSite{{
++		Code:   "PW2TEST",
++		Domain: []*geodata.Domain{{Type: geodata.Domain_Full, Value: domain}},
++	}}}
++	content, err := proto.Marshal(list)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tmp := filepath.Join(dir, "pw2test.dat.tmp")
++	if err := os.WriteFile(tmp, content, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Rename(tmp, filepath.Join(dir, "pw2test.dat")); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func loopbackContext(ip net.IP) context.Context {
++	return peer.NewContext(context.Background(), &peer.Peer{Addr: &net.TCPAddr{IP: ip, Port: 1}})
++}
++
++func TestReloadGeodataRebuildsRegisteredMatchers(t *testing.T) {
++	dir := t.TempDir()
++	t.Setenv("xray.location.asset", dir)
++	writeTestGeoSite(t, dir, "old.example")
++	rules := []*geodata.DomainRule{{Value: &geodata.DomainRule_Geosite{
++		Geosite: &geodata.GeoSiteRule{File: "pw2test.dat", Code: "PW2TEST"},
++	}}}
++	matcher, err := geodata.DomainReg.BuildDomainMatcher(rules)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !matcher.MatchAny("old.example") || matcher.MatchAny("new.example") {
++		t.Fatal("unexpected initial geosite data")
++	}
++
++	writeTestGeoSite(t, dir, "new.example")
++	// 匹配器按“文件:代码”缓存：不调用 ReloadGeodata 时，重新构建（如重载配置）仍得到旧数据。
++	cached, err := geodata.DomainReg.BuildDomainMatcher(rules)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if cached.MatchAny("new.example") {
++		t.Fatal("matcher cache unexpectedly picked up the new file")
++	}
++
++	service := &configReloadService{}
++	if _, err := service.ReloadGeodata(loopbackContext(net.IPv4(192, 0, 2, 1)), nil); status.Code(err) != codes.PermissionDenied {
++		t.Fatalf("non-loopback caller: %v", err)
++	}
++	if _, err := service.ReloadGeodata(loopbackContext(net.IPv4(127, 0, 0, 1)), nil); err != nil {
++		t.Fatal(err)
++	}
++	for name, m := range map[string]geodata.DomainMatcher{"registered": matcher, "cached": cached} {
++		if !m.MatchAny("new.example") || m.MatchAny("old.example") {
++			t.Fatalf("%s matcher was not rebuilt in place", name)
++		}
++	}
++	fresh, err := geodata.DomainReg.BuildDomainMatcher(rules)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !fresh.MatchAny("new.example") {
++		t.Fatal("matchers built after reload must use the new data")
++	}
++
++	if err := os.WriteFile(filepath.Join(dir, "pw2test.dat"), []byte{0x0a, 0xff, 0xff}, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := service.ReloadGeodata(loopbackContext(net.IPv6loopback), nil); status.Code(err) != codes.InvalidArgument {
++		t.Fatalf("broken geosite file: %v", err)
++	}
++	if !matcher.MatchAny("new.example") {
++		t.Fatal("a failed reload must keep the previous data")
++	}
++}
+diff --git a/core/config_reload.go b/core/config_reload.go
+new file mode 100644
+index 0000000..c3078a1
+--- /dev/null
++++ b/core/config_reload.go
+@@ -0,0 +1,571 @@
++package core
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	stdnet "net"
++	"sync"
++
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/serial"
++	"github.com/xtls/xray-core/features"
++	"github.com/xtls/xray-core/features/dns"
++	"github.com/xtls/xray-core/features/inbound"
++	"github.com/xtls/xray-core/features/outbound"
++	"github.com/xtls/xray-core/features/routing"
++	"github.com/xtls/xray-core/transport"
++	"github.com/xtls/xray-core/transport/internet"
++	"google.golang.org/protobuf/proto"
++)
++
++var ErrHotReloadUnsupported = errors.New("hot reload requires core restart")
++
++const maxReloadGenerations = 8
++
++type runtimeGeneration struct {
++	instance   *Instance
++	dispatcher routing.Dispatcher
++	config     *Config
++	cancel     context.CancelFunc
++	active     int
++	retired    bool
++}
++
++type configReloader struct {
++	mu          sync.Mutex
++	applyMu     sync.Mutex
++	closeWait   sync.WaitGroup
++	current     *runtimeGeneration
++	generations []*runtimeGeneration
++	closing     int
++	closed      bool
++}
++
++func newConfigReloader(instance *Instance, dispatcher routing.Dispatcher) *configReloader {
++	initial := &runtimeGeneration{instance: instance, dispatcher: dispatcher}
++	return &configReloader{current: initial, generations: []*runtimeGeneration{initial}}
++}
++
++func staticReloadConfig(config *Config) *Config {
++	result := proto.Clone(config).(*Config)
++	// 入站由初始实例持有，变化的入站在切换时单独关闭重建（见 inboundChanges）。
++	result.Outbound, result.Inbound = nil, nil
++	apps := result.App[:0]
++	for _, app := range result.App {
++		if app.Type != "xray.app.dns.Config" && app.Type != "xray.app.router.Config" {
++			apps = append(apps, app)
++		}
++	}
++	result.App = apps
++	return result
++}
++
++// protobuf 全名以 app/dns/fakedns/fakedns.proto 的 package 为准，测试会对照注册表校验。
++func isFakeDNSApp(app *serial.TypedMessage) bool {
++	return app.Type == "xray.app.dns.fakedns.FakeDnsPoolMulti" || app.Type == "xray.app.dns.fakedns.FakeDnsPool"
++}
++
++// 新运行实例借用初始实例的 FakeDNS 引擎：沿用同一地址池与域名映射，生命周期仍归初始实例。
++// 地址池配置属于静态配置，必须与初始实例一致，因此借用的引擎总能对应新配置。
++type borrowedFakeDNS struct{ dns.FakeDNSEngine }
++
++func (borrowedFakeDNS) Start() error { return nil }
++func (borrowedFakeDNS) Close() error { return nil }
++
++type borrowedFakeDNSRev0 struct{ dns.FakeDNSEngineRev0 }
++
++func (borrowedFakeDNSRev0) Start() error { return nil }
++func (borrowedFakeDNSRev0) Close() error { return nil }
++
++func borrowFakeDNS(owner *Instance) features.Feature {
++	engine, _ := owner.GetFeature((*dns.FakeDNSEngine)(nil)).(dns.FakeDNSEngine)
++	if engine == nil {
++		return nil
++	}
++	if rev0, ok := engine.(dns.FakeDNSEngineRev0); ok {
++		return borrowedFakeDNSRev0{rev0}
++	}
++	return borrowedFakeDNS{engine}
++}
++
++func supportedReloadConfig(config *Config) bool {
++	for _, app := range config.App {
++		if app.Type == "xray.app.metrics.Config" {
++			return false
++		}
++	}
++	for _, outbound := range config.Outbound {
++		if outbound.ProxySettings != nil && (outbound.ProxySettings.Type == "xray.proxy.wireguard.DeviceConfig" || outbound.ProxySettings.Type == "xray.proxy.loopback.Config") {
++			return false
++		}
++	}
++	return true
++}
++
++// 说明需要重启的具体原因，便于运维定位：第一个变化的入站或静态应用、不支持的组件或保留实例上限。
++func reloadUnsupportedReason(previous, next *Config, generations int) string {
++	if !supportedReloadConfig(previous) || !supportedReloadConfig(next) {
++		return "unsupported component (metrics, wireguard or loopback)"
++	}
++	if generations >= maxReloadGenerations {
++		return "too many retained runtime generations"
++	}
++	if _, comparable := inboundChanges(previous.Inbound, next.Inbound); !comparable {
++		return "inbounds without unique tags changed"
++	}
++	oldApps, newApps := staticReloadConfig(previous).App, staticReloadConfig(next).App
++	if len(oldApps) != len(newApps) {
++		return "app set changed"
++	}
++	for i := range oldApps {
++		if !proto.Equal(oldApps[i], newApps[i]) {
++			return "app " + oldApps[i].Type + " changed"
++		}
++	}
++	return "static configuration changed"
++}
++
++type inboundChange struct {
++	tag      string
++	previous *InboundHandlerConfig
++	next     *InboundHandlerConfig
++}
++
++// 按 tag 比较入站：新增、删除与内容变化的入站。没有 tag 或 tag 重复时无法安全对应，返回 false。
++func inboundChanges(previous, next []*InboundHandlerConfig) ([]inboundChange, bool) {
++	old := make(map[string]*InboundHandlerConfig, len(previous))
++	for _, config := range previous {
++		if config.Tag == "" || old[config.Tag] != nil {
++			if len(previous) != len(next) {
++				return nil, false
++			}
++			for i := range previous {
++				if !proto.Equal(previous[i], next[i]) {
++					return nil, false
++				}
++			}
++			return nil, true
++		}
++		old[config.Tag] = config
++	}
++	var changes []inboundChange
++	seen := make(map[string]bool, len(next))
++	for _, config := range next {
++		if config.Tag == "" || seen[config.Tag] {
++			return nil, false
++		}
++		seen[config.Tag] = true
++		if before := old[config.Tag]; before == nil {
++			changes = append(changes, inboundChange{tag: config.Tag, next: config})
++		} else if !proto.Equal(before, config) {
++			changes = append(changes, inboundChange{tag: config.Tag, previous: before, next: config})
++		}
++	}
++	for _, config := range previous {
++		if !seen[config.Tag] {
++			changes = append(changes, inboundChange{tag: config.Tag, previous: config})
++		}
++	}
++	return changes, true
++}
++
++// 在初始实例的入站管理器上应用入站变化：先关闭旧入站（同端口才能重新绑定），再创建并启动新入站。
++// 新入站与原有入站一样经初始实例的分发器交给当前运行实例。任一步失败按相反顺序恢复原入站。
++func (s *Instance) applyInbounds(ctx context.Context, changes []inboundChange) (func(), error) {
++	manager, _ := s.GetFeature(inbound.ManagerType()).(inbound.Manager)
++	if manager == nil {
++		return nil, ErrHotReloadUnsupported
++	}
++	add := func(config *InboundHandlerConfig) error {
++		raw, err := CreateObject(s, config)
++		if err != nil {
++			return err
++		}
++		handler, ok := raw.(inbound.Handler)
++		if !ok {
++			return errors.New("not an inbound handler")
++		}
++		if err := manager.AddHandler(ctx, handler); err != nil {
++			// 管理器先登记再启动：启动失败时登记仍在，必须移除（同时关闭已启动的部分）。
++			if current, _ := manager.GetHandler(ctx, config.Tag); current == handler {
++				manager.RemoveHandler(ctx, config.Tag)
++			} else {
++				handler.Close()
++			}
++			return err
++		}
++		return nil
++	}
++	var undo []func()
++	rollback := func() {
++		for i := len(undo) - 1; i >= 0; i-- {
++			undo[i]()
++		}
++	}
++	// 先关闭全部要删除或替换的旧入站，再创建新入站：换 tag 但沿用端口（如重定向改为 TPROXY）时才能绑定。
++	for _, change := range changes {
++		change := change
++		if change.previous != nil {
++			if err := manager.RemoveHandler(ctx, change.tag); err != nil && !errors.Is(err, common.ErrNoClue) {
++				rollback()
++				return nil, fmt.Errorf("close inbound %s: %w", change.tag, err)
++			}
++			undo = append(undo, func() { _ = add(change.previous) })
++		}
++	}
++	for _, change := range changes {
++		change := change
++		if change.next != nil {
++			if err := add(change.next); err != nil {
++				rollback()
++				return nil, fmt.Errorf("create inbound %s: %w", change.tag, err)
++			}
++			undo = append(undo, func() { _ = manager.RemoveHandler(ctx, change.tag) })
++		}
++	}
++	return rollback, nil
++}
++
++func (r *configReloader) collectLocked(generation *runtimeGeneration) {
++	if !generation.retired || generation.active != 0 || generation.cancel == nil {
++		return
++	}
++	for i, candidate := range r.generations {
++		if candidate == generation {
++			r.generations = append(r.generations[:i], r.generations[i+1:]...)
++			break
++		}
++	}
++	cancel := generation.cancel
++	generation.cancel = nil
++	r.closeWait.Add(1)
++	r.closing++
++	go func() {
++		defer r.closeWait.Done()
++		cancel()
++		generation.instance.Close()
++		r.mu.Lock()
++		r.closing--
++		r.mu.Unlock()
++	}()
++}
++
++func (r *configReloader) acquire() (*runtimeGeneration, func()) {
++	r.mu.Lock()
++	if r.closed {
++		r.mu.Unlock()
++		return nil, func() {}
++	}
++	generation := r.current
++	generation.active++
++	r.mu.Unlock()
++	var once sync.Once
++	return generation, func() {
++		once.Do(func() {
++			r.mu.Lock()
++			generation.active--
++			r.collectLocked(generation)
++			r.mu.Unlock()
++		})
++	}
++}
++
++func (s *Instance) dialerContext(ctx context.Context) context.Context {
++	client, _ := s.GetFeature(dns.ClientType()).(dns.Client)
++	manager, _ := s.GetFeature(outbound.ManagerType()).(outbound.Manager)
++	return internet.ContextWithDialerState(ctx, client, manager)
++}
++
++func (s *Instance) AcquireActiveRuntime() (*Instance, func()) {
++	if s.reloader == nil {
++		return s, func() {}
++	}
++	generation, release := s.reloader.acquire()
++	if generation == nil {
++		return nil, release
++	}
++	return generation.instance, release
++}
++
++func (s *Instance) ReloadConfig(requestCtx context.Context, config *Config) error {
++	if s.reloader == nil || !s.started.Load() {
++		return ErrHotReloadUnsupported
++	}
++	r := s.reloader
++	r.applyMu.Lock()
++	defer r.applyMu.Unlock()
++	r.mu.Lock()
++	if r.closed {
++		r.mu.Unlock()
++		return stdnet.ErrClosed
++	}
++	previous := r.current
++	if proto.Equal(previous.config, config) {
++		r.mu.Unlock()
++		return nil
++	}
++	changes, comparable := inboundChanges(previous.config.Inbound, config.Inbound)
++	if !comparable || !supportedReloadConfig(previous.config) || !supportedReloadConfig(config) ||
++		!proto.Equal(staticReloadConfig(previous.config), staticReloadConfig(config)) ||
++		len(r.generations)+r.closing >= maxReloadGenerations {
++		reason := reloadUnsupportedReason(previous.config, config, len(r.generations)+r.closing)
++		r.mu.Unlock()
++		return fmt.Errorf("%w: %s", ErrHotReloadUnsupported, reason)
++	}
++	r.mu.Unlock()
++	if err := requestCtx.Err(); err != nil {
++		return err
++	}
++	staged := proto.Clone(config).(*Config)
++	staged.Inbound = nil
++	var apps []*serial.TypedMessage
++	fakeDNS := false
++	for _, app := range staged.App {
++		// 预加载不能注册全局日志，也不能重复绑定控制端口；FakeDNS 改为借用初始实例的引擎。
++		if isFakeDNSApp(app) {
++			fakeDNS = true
++		} else if app.Type != "xray.app.log.Config" && app.Type != "xray.app.commander.Config" {
++			apps = append(apps, app)
++		}
++	}
++	staged.App = apps
++	ctx, cancel := context.WithCancel(s.ctx)
++	stopCancellation := context.AfterFunc(requestCtx, cancel)
++	defer stopCancellation()
++	instance := &Instance{ctx: ctx, reloadStaging: true}
++	if fakeDNS {
++		borrowed := borrowFakeDNS(s)
++		if borrowed == nil {
++			cancel()
++			return ErrHotReloadUnsupported
++		}
++		if err := instance.AddFeature(borrowed); err != nil {
++			cancel()
++			return err
++		}
++	}
++	_, err := initInstanceWithConfig(staged, instance)
++	if err != nil {
++		cancel()
++		instance.Close()
++		return err
++	}
++	manager := instance.GetFeature(outbound.ManagerType()).(outbound.Manager)
++	if manager.GetDefaultHandler() == nil {
++		cancel()
++		instance.Close()
++		return errors.New("no outbound available")
++	}
++	for _, rule := range instance.GetFeature(routing.RouterType()).(routing.Router).ListRule() {
++		if tag := rule.GetOutboundTag(); tag != "" && manager.GetHandler(tag) == nil {
++			cancel()
++			instance.Close()
++			return errors.New("routing references an unavailable outbound")
++		}
++	}
++	if err = instance.Start(); err != nil {
++		cancel()
++		instance.Close()
++		return err
++	}
++	if !stopCancellation() || requestCtx.Err() != nil || ctx.Err() != nil {
++		cancel()
++		instance.Close()
++		return errors.New("hot reload request canceled before commit")
++	}
++	// 入站变化在新运行实例就绪之后、切换之前应用。
++	var undoInbounds func()
++	if len(changes) > 0 {
++		if undoInbounds, err = s.applyInbounds(s.ctx, changes); err != nil {
++			cancel()
++			instance.Close()
++			return fmt.Errorf("apply hot reload inbounds: %w", err)
++		}
++	}
++	r.mu.Lock()
++	if r.closed {
++		r.mu.Unlock()
++		if undoInbounds != nil {
++			undoInbounds()
++		}
++		cancel()
++		instance.Close()
++		return stdnet.ErrClosed
++	}
++	generation := &runtimeGeneration{instance: instance, dispatcher: instance.GetFeature(routing.DispatcherType()).(routing.Dispatcher), config: proto.Clone(config).(*Config), cancel: cancel}
++	r.generations = append(r.generations, generation)
++	r.current = generation
++	previous.retired = true
++	r.collectLocked(previous)
++	r.mu.Unlock()
++	return nil
++}
++
++func (r *configReloader) close() {
++	r.applyMu.Lock()
++	defer r.applyMu.Unlock()
++	r.mu.Lock()
++	r.closed = true
++	var targets []struct {
++		cancel   context.CancelFunc
++		instance *Instance
++	}
++	for _, generation := range r.generations {
++		if generation.cancel != nil {
++			targets = append(targets, struct {
++				cancel   context.CancelFunc
++				instance *Instance
++			}{generation.cancel, generation.instance})
++			generation.cancel = nil
++		}
++	}
++	r.generations = nil
++	r.mu.Unlock()
++	for _, target := range targets {
++		target.cancel()
++		target.instance.Close()
++	}
++	r.closeWait.Wait()
++}
++
++type runtimeDispatcher struct {
++	routing.Dispatcher
++	reload *configReloader
++}
++
++// 半关闭只释放对应方向；两个方向结束或请求取消后才能回收旧实例。
++type linkLease struct {
++	mu       sync.Mutex
++	finished int
++	released bool
++	release  func()
++	stop     func() bool
++}
++
++func newLinkLease(ctx context.Context, release func()) *linkLease {
++	lease := &linkLease{release: release}
++	stop := context.AfterFunc(ctx, func() { lease.finish(true) })
++	lease.mu.Lock()
++	if lease.released {
++		lease.mu.Unlock()
++		stop()
++	} else {
++		lease.stop = stop
++		lease.mu.Unlock()
++	}
++	return lease
++}
++
++func (l *linkLease) finish(all bool) {
++	l.mu.Lock()
++	if l.released {
++		l.mu.Unlock()
++		return
++	}
++	l.finished++
++	if !all && l.finished < 2 {
++		l.mu.Unlock()
++		return
++	}
++	l.released = true
++	stop := l.stop
++	l.mu.Unlock()
++	if stop != nil {
++		stop()
++	}
++	l.release()
++}
++
++type leasedReader struct {
++	buf.Reader
++	once  sync.Once
++	lease *linkLease
++}
++
++func (r *leasedReader) finish() { r.once.Do(func() { r.lease.finish(false) }) }
++func (r *leasedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
++	mb, err := r.Reader.ReadMultiBuffer()
++	if err != nil {
++		r.finish()
++	}
++	return mb, err
++}
++func (r *leasedReader) Interrupt() {
++	common.Interrupt(r.Reader)
++	r.finish()
++}
++func (r *leasedReader) Close() error {
++	common.Interrupt(r.Reader)
++	r.finish()
++	return nil
++}
++
++type leasedWriter struct {
++	buf.Writer
++	once  sync.Once
++	lease *linkLease
++}
++
++func (w *leasedWriter) finish() { w.once.Do(func() { w.lease.finish(false) }) }
++func (w *leasedWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
++	err := w.Writer.WriteMultiBuffer(mb)
++	if err != nil {
++		w.finish()
++	}
++	return err
++}
++func (w *leasedWriter) Interrupt() {
++	common.Interrupt(w.Writer)
++	w.finish()
++}
++func (w *leasedWriter) Close() error {
++	var err error
++	if closer, ok := w.Writer.(io.Closer); ok {
++		err = closer.Close()
++	} else {
++		common.Interrupt(w.Writer)
++	}
++	w.finish()
++	return err
++}
++
++func leaseLink(link *transport.Link, lease *linkLease) {
++	link.Reader = &leasedReader{Reader: link.Reader, lease: lease}
++	link.Writer = &leasedWriter{Writer: link.Writer, lease: lease}
++}
++
++func (d *runtimeDispatcher) Dispatch(ctx context.Context, destination net.Destination) (*transport.Link, error) {
++	generation, release := d.reload.acquire()
++	if generation == nil {
++		return nil, stdnet.ErrClosed
++	}
++	ctx = generation.instance.dialerContext(ctx)
++	lease := newLinkLease(ctx, release)
++	link, err := generation.dispatcher.Dispatch(ctx, destination)
++	if err != nil {
++		lease.finish(true)
++		return nil, err
++	}
++	leaseLink(link, lease)
++	return link, nil
++}
++
++func (d *runtimeDispatcher) DispatchLink(ctx context.Context, destination net.Destination, link *transport.Link) error {
++	generation, release := d.reload.acquire()
++	if generation == nil {
++		return stdnet.ErrClosed
++	}
++	ctx = generation.instance.dialerContext(ctx)
++	lease := newLinkLease(ctx, release)
++	leased := *link
++	leaseLink(&leased, lease)
++	err := generation.dispatcher.DispatchLink(ctx, destination, &leased)
++	if err != nil {
++		lease.finish(true)
++	}
++	return err
++}
+diff --git a/core/config_reload_test.go b/core/config_reload_test.go
+new file mode 100644
+index 0000000..9c5cb37
+--- /dev/null
++++ b/core/config_reload_test.go
+@@ -0,0 +1,90 @@
++package core
++
++import (
++	"context"
++	"fmt"
++	"sync"
++	"sync/atomic"
++	"testing"
++
++	"github.com/xtls/xray-core/common/serial"
++)
++
++func TestHotReloadLeaseHalfClose(t *testing.T) {
++	var released atomic.Int32
++	lease := newLinkLease(context.Background(), func() { released.Add(1) })
++	reader := &leasedReader{lease: lease}
++	writer := &leasedWriter{lease: lease}
++	reader.finish()
++	reader.finish()
++	if released.Load() != 0 {
++		t.Fatal("半关闭错误地释放了运行实例")
++	}
++	writer.finish()
++	writer.finish()
++	if released.Load() != 1 {
++		t.Fatal("双向关闭必须且只能释放一次")
++	}
++}
++
++func TestHotReloadLeaseCancelConcurrent(t *testing.T) {
++	for i := 0; i < 100; i++ {
++		ctx, cancel := context.WithCancel(context.Background())
++		var released atomic.Int32
++		lease := newLinkLease(ctx, func() { released.Add(1) })
++		reader := &leasedReader{lease: lease}
++		writer := &leasedWriter{lease: lease}
++		var group sync.WaitGroup
++		for _, fn := range []func(){cancel, reader.finish, writer.finish} {
++			group.Add(1)
++			go func(fn func()) { defer group.Done(); fn() }(fn)
++		}
++		group.Wait()
++		if released.Load() != 1 {
++			t.Fatal("并发结束必须且只能释放一次")
++		}
++	}
++}
++
++func TestHotReloadCancelBeforeCommit(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	var released atomic.Int32
++	lease := newLinkLease(ctx, func() { released.Add(1) })
++	lease.finish(true)
++	if released.Load() != 1 {
++		t.Fatal("已取消的请求未释放引用")
++	}
++}
++
++func TestHotReloadInboundChanges(t *testing.T) {
++	inbound := func(tag string, port uint32) *InboundHandlerConfig {
++		return &InboundHandlerConfig{Tag: tag, ReceiverSettings: serial.ToTypedMessage(&InboundHandlerConfig{Tag: fmt.Sprint(port)})}
++	}
++	previous := []*InboundHandlerConfig{inbound("a", 1), inbound("b", 2), inbound("c", 3)}
++	next := []*InboundHandlerConfig{inbound("b", 2), inbound("a", 4), inbound("d", 5)}
++	changes, ok := inboundChanges(previous, next)
++	if !ok || len(changes) != 3 {
++		t.Fatalf("入站差异计算错误：%v %d", ok, len(changes))
++	}
++	kinds := map[string]string{}
++	for _, change := range changes {
++		switch {
++		case change.previous != nil && change.next != nil:
++			kinds[change.tag] = "changed"
++		case change.next != nil:
++			kinds[change.tag] = "added"
++		default:
++			kinds[change.tag] = "removed"
++		}
++	}
++	if kinds["a"] != "changed" || kinds["d"] != "added" || kinds["c"] != "removed" || kinds["b"] != "" {
++		t.Fatalf("入站差异分类错误：%v", kinds)
++	}
++	if _, ok := inboundChanges(previous, append(next, inbound("", 6))); ok {
++		t.Fatal("没有 tag 的新入站不能热重载")
++	}
++	if changes, ok := inboundChanges(previous, previous); !ok || len(changes) != 0 {
++		t.Fatal("相同入站不应产生变化")
++	}
++}
+diff --git a/core/config_reload_types_test.go b/core/config_reload_types_test.go
+new file mode 100644
+index 0000000..05980a1
+--- /dev/null
++++ b/core/config_reload_types_test.go
+@@ -0,0 +1,29 @@
++package core_test
++
++import (
++	"testing"
++
++	"github.com/xtls/xray-core/app/dns/fakedns"
++	"github.com/xtls/xray-core/app/log"
++	"github.com/xtls/xray-core/app/metrics"
++	"github.com/xtls/xray-core/common/serial"
++	. "github.com/xtls/xray-core/core"
++)
++
++// 类型名写错时判断会静默失效：FakeDNS 不再借用初始实例的地址池，metrics 也不再被拒绝。
++func TestHotReloadAppTypeNames(t *testing.T) {
++	for _, message := range []*serial.TypedMessage{
++		serial.ToTypedMessage(&fakedns.FakeDnsPoolMulti{}),
++		serial.ToTypedMessage(&fakedns.FakeDnsPool{}),
++	} {
++		if !IsFakeDNSAppForTest(message) {
++			t.Fatalf("未识别 FakeDNS 应用类型 %s", message.Type)
++		}
++	}
++	if IsFakeDNSAppForTest(serial.ToTypedMessage(&log.Config{})) {
++		t.Fatal("把日志应用误判为 FakeDNS")
++	}
++	if SupportedReloadConfigForTest(&Config{App: []*serial.TypedMessage{serial.ToTypedMessage(&metrics.Config{})}}) {
++		t.Fatal("metrics 应用必须要求核心重启")
++	}
++}
+diff --git a/core/export_reload_test.go b/core/export_reload_test.go
+new file mode 100644
+index 0000000..bf9b5a3
+--- /dev/null
++++ b/core/export_reload_test.go
+@@ -0,0 +1,7 @@
++package core
++
++// 供外部测试包校验热重载对应用类型名的判断。
++var (
++	IsFakeDNSAppForTest          = isFakeDNSApp
++	SupportedReloadConfigForTest = supportedReloadConfig
++)
+diff --git a/main/commands/all/api/config_reload.go b/main/commands/all/api/config_reload.go
+new file mode 100644
+index 0000000..d0d814a
+--- /dev/null
++++ b/main/commands/all/api/config_reload.go
+@@ -0,0 +1,79 @@
++package api
++
++import (
++	"fmt"
++	"io"
++	"os"
++
++	"github.com/xtls/xray-core/app/proxyman/command"
++	"github.com/xtls/xray-core/main/commands/base"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	"google.golang.org/protobuf/types/known/wrapperspb"
++)
++
++var cmdReloadConfig = &base.Command{
++	CustomFlags: true,
++	UsageLine:   "{{.Exec}} api reloadconfig [--server=127.0.0.1:8080] [--check] [--geodata] [<config.json>]",
++	Short:       "Hot reload outbound, routing and DNS configuration",
++	Long:        "新配置先预加载，再切换新连接；已有连接继续使用旧实例。--check 只查询能力。--geodata 先重新读取 geoip/geosite 数据文件并原地重建匹配器，可不带配置单独使用。需要完整核心重启时退出码为 2，其他失败为 1。",
++	Run:         executeReloadConfig,
++}
++
++func executeReloadConfig(cmd *base.Command, args []string) {
++	setSharedFlags(cmd)
++	check := cmd.Flag.Bool("check", false, "")
++	local := cmd.Flag.Bool("local", false, "")
++	geodata := cmd.Flag.Bool("geodata", false, "")
++	cmd.Flag.Parse(args)
++	if *local {
++		fmt.Println(`{"hot_reload_version":1,"geodata":true}`)
++		return
++	}
++	var content []byte
++	files := cmd.Flag.Args()
++	geodataOnly := *geodata && !*check && len(files) == 0
++	if !*check && !geodataOnly {
++		if len(files) != 1 {
++			base.Fatalf("one configuration file required")
++		}
++		reader, err := loadArg(files[0])
++		if err != nil {
++			base.Fatalf("unable to read configuration")
++		}
++		if closer, ok := reader.(io.Closer); ok {
++			defer closer.Close()
++		}
++		content, err = io.ReadAll(io.LimitReader(reader, (4<<20)+1))
++		if err != nil || len(content) == 0 || len(content) > 4<<20 {
++			base.Fatalf("invalid configuration size")
++		}
++	}
++	conn, ctx, close := dialAPIServer()
++	defer close()
++	invoke := func(method string, request []byte, action string) {
++		response := new(wrapperspb.Int32Value)
++		err := conn.Invoke(ctx, method, wrapperspb.Bytes(request), response)
++		if err != nil {
++			if status.Code(err) == codes.FailedPrecondition || status.Code(err) == codes.Unimplemented {
++				// 第一行保持 requires_restart 便于脚本判断，第二行给出核心报告的原因。
++				fmt.Fprintln(os.Stderr, "requires_restart")
++				fmt.Fprintln(os.Stderr, status.Convert(err).Message())
++				os.Exit(2)
++			}
++			base.Fatalf("%s not applied: %s: %s", action, status.Code(err), status.Convert(err).Message())
++		}
++		if response.Value != 1 {
++			base.Fatalf("unsupported hot reload protocol")
++		}
++	}
++	if *geodata && !*check {
++		invoke(command.ConfigReloadGeodataMethod, nil, "geodata")
++		if geodataOnly {
++			fmt.Println(`{"hot_reload_version":1,"geodata":true,"applied":true}`)
++			return
++		}
++	}
++	invoke(command.ConfigReloadMethod, content, "configuration")
++	fmt.Println(`{"hot_reload_version":1,"applied":` + fmt.Sprint(!*check) + `}`)
++}
+diff --git a/transport/internet/dialer_context.go b/transport/internet/dialer_context.go
+new file mode 100644
+index 0000000..6031d4a
+--- /dev/null
++++ b/transport/internet/dialer_context.go
+@@ -0,0 +1,29 @@
++package internet
++
++import (
++	"context"
++
++	"github.com/xtls/xray-core/features/dns"
++	"github.com/xtls/xray-core/features/outbound"
++)
++
++type dialerStateKey struct{}
++type dialerState struct {
++	dns      dns.Client
++	outbound outbound.Manager
++}
++
++// ContextWithDialerState 将拨号依赖绑定到请求所属实例，避免预加载修改全局 DNS。
++func ContextWithDialerState(ctx context.Context, dc dns.Client, om outbound.Manager) context.Context {
++	return context.WithValue(ctx, dialerStateKey{}, dialerState{dns: dc, outbound: om})
++}
++
++func stateForDialer(ctx context.Context) dialerState {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	if state, ok := ctx.Value(dialerStateKey{}).(dialerState); ok {
++		return state
++	}
++	return dialerState{dns: dnsClient, outbound: obm}
++}

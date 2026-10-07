@@ -34,7 +34,12 @@ local function ln_run(s, d, command, output)
 	return string.format("%s >%s 2>&1 &", d .. " " ..command, output)
 end
 
+local function migrate()
+	require(require_dir .. "server_migrate").run(uci, CONFIG, log)
+end
+
 local function start()
+	migrate()
 	local enabled = tonumber(api.uci_get_s("@global[0]", "enable") or 0)
 	if enabled == nil or enabled == 0 then
 		return
@@ -163,5 +168,7 @@ if action then
 		start()
 	elseif action == "stop" then
 		stop()
+	elseif action == "migrate" then
+		migrate()
 	end
 end

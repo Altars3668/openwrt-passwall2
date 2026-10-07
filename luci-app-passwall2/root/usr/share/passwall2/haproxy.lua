@@ -114,7 +114,7 @@ api.uci_foreach_c("haproxy_config", function(t)
 					if cache then
 						new_port = cache
 					else
-						new_port = api.get_new_port()
+						new_port = api.get_new_port(nil, "haproxy:" .. t[".name"])
 						local config_file = string.format("%s_%s.json", t[".name"], new_port)
 						sys.call(string.format('/usr/share/%s/app.sh run_socks "%s"> /dev/null',
 							appname,

@@ -14,14 +14,89 @@ IPSET_VPS6="psw2_vps6"
 IPSET_WAN6="psw2_wan6"
 
 FWMARK="0x50535732"
+# 使用默认实例（全局节点及跟随全局的访问控制）的分流项放在共享子链中，热切换全局节点时用 iptables-restore --noflush 原子替换。
+# 子链命中直连项时置一次性标记位，主链紧接的规则按它 goto 清标记链（结束后返回主链的调用者），等同于原先在主链中 RETURN。
+SHUNT_DIRECT_MARK="0x80000000"
+SHUNT_MARK_KEEP="0x7fffffff"
+SHUNT_HELPER_CHAINS="PSW2_SHUNT_DIRECT PSW2_SHUNT_RETURN"
+SHUNT_CHAINS="PSW2_SHUNT_NAT PSW2_SHUNT_ICMP PSW2_SHUNT_ICMP6 PSW2_SHUNT_MARK PSW2_SHUNT_MARK6"
 
 ipt=$(command -v iptables-legacy || command -v iptables)
 ip6t=$(command -v ip6tables-legacy || command -v ip6tables)
+IPT_BIN=$ipt
+IP6T_BIN=$ip6t
 
-ipt_n="$ipt -t nat -w"
-ipt_m="$ipt -t mangle -w"
-ip6t_n="$ip6t -t nat -w"
-ip6t_m="$ip6t -t mangle -w"
+# 规则配方：启动、热重载与运行时改动经 ipt_run 执行的 iptables 命令按顺序记录在 $TMP_PATH/ipt.log
+# （每行一条，字段以 \037 分隔；iptables-restore 与 ipset -R 的输入以 \036 结束）。
+# 差量热重载据此判断防火墙是否需要变化；影子启动（PW2_STAGE）只记录、不执行，查询由 reconcile.lua 模拟。
+IPT_LOG=${TMP_PATH:-/tmp/etc/passwall2}/ipt.log
+RECONCILE_LUA=${PW2_RECONCILE_LUA:-/usr/lib/lua/luci/passwall2/reconcile.lua}
+
+ipt_record() {
+	[ -d "${IPT_LOG%/*}" ] || return 0
+	{
+		printf '%s' "$1"
+		shift
+		for _arg in "$@"; do printf '\037%s' "${_arg}"; done
+		printf '\n'
+	} >> "${IPT_LOG}"
+}
+
+# 查询命令（-L、-nL 等）不改变规则，不记录。
+ipt_query() {
+	local _arg
+	for _arg in "$@"; do
+		case "${_arg}" in --list|-L|-[a-zA-Z]*L*) return 0 ;; esac
+	done
+	return 1
+}
+
+ipt_run() {
+	local family=$1 table=$2 bin=$IPT_BIN
+	shift 2
+	[ "${family}" = "6" ] && bin=$IP6T_BIN
+	if [ -n "${PW2_STAGE}" ]; then
+		if ipt_query "$@"; then
+			lua "${RECONCILE_LUA}" ipt-list "${IPT_LOG}" "${family}" "${table}" "$@"
+			return $?
+		fi
+		ipt_record C "${family}" "${table}" "$@"
+		return 0
+	fi
+	ipt_query "$@" || ipt_record C "${family}" "${table}" "$@"
+	$bin -t "${table}" -w "$@"
+}
+
+# 一个地址族的 iptables-restore --noflush 输入（标准输入）；影子启动只记录。
+ipt_restore() {
+	local family=$1
+	local input=$(cat)
+	ipt_record R "${family}"
+	{ echo "${input}"; printf '\036\n'; } >> "${IPT_LOG}" 2>/dev/null
+	[ -n "${PW2_STAGE}" ] && return 0
+	if [ "${family}" = "6" ]; then
+		echo "${input}" | ${IP6T_BIN}-restore --noflush
+	else
+		echo "${input}" | ${IPT_BIN}-restore --noflush
+	fi
+}
+
+# 影子启动中的 ipset：查询照常读取系统，修改只记录（由热重载提交时按集合语义应用）。
+[ -n "${PW2_STAGE}" ] && ipset() {
+	case " $* " in
+		*" list "*|*" -L "*|*" test "*) command ipset "$@"; return $? ;;
+	esac
+	ipt_record S "$@"
+	case " $* " in
+		*" -R "*|*" restore "*) { cat; printf '\036\n'; } >> "${IPT_LOG}" ;;
+	esac
+	return 0
+}
+
+ipt_n="ipt_run 4 nat"
+ipt_m="ipt_run 4 mangle"
+ip6t_n="ipt_run 6 nat"
+ip6t_m="ipt_run 6 mangle"
 [ -z "$ip6t" -o -z "$(lsmod | grep 'ip6table_nat')" ] && ip6t_n="eval #$ip6t_n"
 [ -z "$ip6t" -o -z "$(lsmod | grep 'ip6table_mangle')" ] && ip6t_m="eval #$ip6t_m"
 FWI=$(uci -q get firewall.passwall2.path 2>/dev/null)
@@ -196,21 +271,36 @@ gen_shunt_list() {
 				[ -n "$shunt_node" ] && {
 					local ipset_v4="psw2_${node}_${shunt_id}"
 					local ipset_v6="psw2_${node}_${shunt_id}6"
-					ipset -! create $ipset_v4 nethash maxelem 1048576
-					ipset -! create $ipset_v6 nethash family inet6 maxelem 1048576
 					local outbound="redirect"
 					[ "$shunt_node" = "_direct" ] && outbound="direct"
 					[ "$shunt_node" = "_default" ] && outbound="${default_outbound}"
 					_SHUNT_LIST4="${_SHUNT_LIST4} ${ipset_v4}:${outbound}"
 					_SHUNT_LIST6="${_SHUNT_LIST6} ${ipset_v6}:${outbound}"
+					# 热切换或同一节点再次使用时，已存在的集合沿用已载入的内容，避免重复解析 GeoIP。
+					[ -n "${SHUNT_PRESERVE_SETS}" ] && ipset -q list -n $ipset_v4 >/dev/null && \
+						ipset -q list -n $ipset_v6 >/dev/null && continue
+					# 影子启动：运行中已有的规则集合沿用原内容（内容变化由集合热刷新处理）。
+					[ -n "${PW2_STAGE}" ] && [ -z "${PW2_STAGE_REFRESH}" ] && ipset -q list -n $ipset_v4 >/dev/null && \
+						ipset -q list -n $ipset_v6 >/dev/null && {
+						echo "$ipset_v4 $ipset_v6" >> "$TMP_PATH/preserved_sets"
+						continue
+					}
+					ipset -! create $ipset_v4 nethash maxelem 1048576
+					ipset -! create $ipset_v6 nethash family inet6 maxelem 1048576
+					# 热刷新：写入临时集合，全部完成后由 refresh_sets 用 ipset swap 逐个原子替换。
+					local fill_v4=$ipset_v4 fill_v6=$ipset_v6
+					[ -n "${IPSET_REFRESH}" ] && {
+						fill_v4=$(refresh_set $ipset_v4 nethash maxelem 1048576)
+						fill_v6=$(refresh_set $ipset_v6 nethash family inet6 maxelem 1048576)
+					}
 
-					config_n_get $shunt_id ip_list | sed 's/#.*//' | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $ipset_v4 &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
-					config_n_get $shunt_id ip_list | sed 's/#.*//' | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $ipset_v6 &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
+					config_n_get $shunt_id ip_list | sed 's/#.*//' | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $fill_v4 &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
+					config_n_get $shunt_id ip_list | sed 's/#.*//' | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $fill_v6 &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
 					[ "${enable_geoview_ip}" = "1" ] && {
 						local _geoip_code=$(config_n_get $shunt_id ip_list | tr -s "\r\n" "\n" | sed -e "/^$/d" | grep -E "^geoip:" | grep -v "^geoip:private" | sed -E 's/^geoip:(.*)/\1/' | sed ':a;N;$!ba;s/\n/,/g')
 						[ -n "$_geoip_code" ] && {
-							get_geoip $_geoip_code ipv4 | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $ipset_v4 &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
-							get_geoip $_geoip_code ipv6 | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $ipset_v6 &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
+							get_geoip $_geoip_code ipv4 | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $fill_v4 &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
+							get_geoip $_geoip_code ipv6 | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $fill_v6 &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
 							#log 3 "$(i18n "parse the traffic splitting rules[%s]-[geoip:%s] add to %s to complete." "${shunt_id}" "${_geoip_code}" "IPSET[${ipset_v4},${ipset_v6}]")"
 						}
 					}
@@ -220,11 +310,14 @@ gen_shunt_list() {
 		local direct_ipset4=$(get_cache_var "node_${node}_direct_ipset4")
 		[ -n "${direct_ipset4}" ] && {
 			ipset -! create ${direct_ipset4} iphash maxelem 1048576 timeout 259200
+			# 热刷新按上游 flush_set 语义清空直连写集合，由 DNS 重新写入。
+			[ -n "${IPSET_REFRESH}" ] && ipset -q flush ${direct_ipset4}
 			_SHUNT_LIST4="${_SHUNT_LIST4} ${direct_ipset4}:direct"
 		}
 		local direct_ipset6=$(get_cache_var "node_${node}_direct_ipset6")
 		[ -n "${direct_ipset6}" ] && {
 			ipset -! create ${direct_ipset6} iphash family inet6 maxelem 1048576 timeout 259200
+			[ -n "${IPSET_REFRESH}" ] && ipset -q flush ${direct_ipset6}
 			_SHUNT_LIST6="${_SHUNT_LIST6} ${direct_ipset6}:direct"
 		}
 	}
@@ -233,11 +326,40 @@ gen_shunt_list() {
 	set_cache_var "node_${node}_gen_shunt_list" "1"
 }
 
+# 热刷新用的临时集合：名字由正式集合名的摘要得出（ipset 名最长 31 字符），记录待 refresh_sets 交换。
+refresh_set() {
+	local real=${1}; shift
+	local tmp="psw2_r$(echo -n "${real}" | md5sum | cut -c1-12)"
+	ipset -q destroy ${tmp}
+	ipset -! create ${tmp} "$@"
+	echo "${tmp} ${real}" >> "${IPSET_REFRESH}"
+	echo ${tmp}
+}
+
 add_shunt_t_rule() {
 	local shunt_args=${1}
 	local t_args=${2}
 	local t_jump_args=${3}
 	local t_ports_args=${4}
+	if [ "${shunt_args}" = "@global" ]; then
+		# 默认实例的分流项在共享子链中：按原来的端口限制跳转（打标记的子链跳过已由代理接管的连接，
+		# 与 nftables 的 ct mark 条件一致）；子链命中直连项时置标记，下一条规则据此结束本主链。
+		local chain guard=""
+		case "${t_args}" in
+			*"ipt_run 6 mangle"*) chain="PSW2_SHUNT_MARK6"; guard="-m connmark ! --mark ${FWMARK}" ;;
+			*"ipt_run 4 mangle"*) chain="PSW2_SHUNT_MARK"; guard="-m connmark ! --mark ${FWMARK}" ;;
+			*"-p ipv6-icmp"*) chain="PSW2_SHUNT_ICMP6" ;;
+			*"-p icmp"*) chain="PSW2_SHUNT_ICMP" ;;
+			*) chain="PSW2_SHUNT_NAT" ;;
+		esac
+		if [ -z "${t_ports_args}" ] || [ "${t_ports_args}" == "1:65535" ]; then
+			${t_args} ${guard} -j ${chain}
+		else
+			add_port_rules "${t_args}" "${t_ports_args}" "${guard} -j ${chain}"
+		fi
+		${t_args} -m mark --mark ${SHUNT_DIRECT_MARK}/${SHUNT_DIRECT_MARK} -g PSW2_SHUNT_RETURN
+		return
+	fi
 	[ -n "${shunt_args}" ] && {
 		for j in ${shunt_args}; do
 			local _set_name=$(echo ${j} | awk -F ':' '{print $1}')
@@ -255,13 +377,138 @@ add_shunt_t_rule() {
 	}
 }
 
+# 输出一个表的分流子链（先声明以清空，再填充），交给 iptables-restore --noflush 在该表的一次提交中原子替换。
+gen_shunt_chains() {
+	local family=${1}
+	local table=${2}
+	local redir_port=${3}
+	local list chains chain verdict item set_name outbound
+	list=${SHUNT_LIST4}
+	[ "${family}" = "6" ] && list=${SHUNT_LIST6}
+	case "${family}${table}" in
+		4nat) chains="PSW2_SHUNT_NAT PSW2_SHUNT_ICMP" ;;
+		4mangle) chains="PSW2_SHUNT_MARK" ;;
+		6nat) chains="PSW2_SHUNT_ICMP6" ;;
+		6mangle) chains="PSW2_SHUNT_MARK6" ;;
+	esac
+	echo "*${table}"
+	for chain in ${chains} ${SHUNT_HELPER_CHAINS}; do
+		echo ":${chain} - [0:0]"
+	done
+	echo "-A PSW2_SHUNT_DIRECT -j MARK --or-mark ${SHUNT_DIRECT_MARK}"
+	echo "-A PSW2_SHUNT_RETURN -j MARK --and-mark ${SHUNT_MARK_KEEP}"
+	[ -n "${redir_port}" ] && for chain in ${chains}; do
+		case "${chain}" in
+			PSW2_SHUNT_NAT) verdict="-p tcp $(REDIRECT ${redir_port})" ;;
+			PSW2_SHUNT_ICMP|PSW2_SHUNT_ICMP6) verdict="$(REDIRECT)" ;;
+			*) verdict="-j PSW2_RULE" ;;
+		esac
+		for item in ${list}; do
+			set_name=${item%%:*}
+			outbound=${item##*:}
+			[ -n "${set_name}" ] && [ -n "${outbound}" ] || continue
+			if [ "${outbound}" = "direct" ]; then
+				echo "-A ${chain} $(dst ${set_name}) -g PSW2_SHUNT_DIRECT"
+			else
+				echo "-A ${chain} $(dst ${set_name}) ${verdict}"
+			fi
+		done
+	done
+	echo "COMMIT"
+}
+
+# 按当前 SHUNT_LIST4/6 建立或替换全部分流子链；IPv6 表不可用时跳过（与上游 ip6t_n/ip6t_m 的判断一致）。
+apply_shunt_chains() {
+	local redir_port=${1}
+	{ gen_shunt_chains 4 nat "${redir_port}"; gen_shunt_chains 4 mangle "${redir_port}"; } | ipt_restore 4 || return 1
+	case "${ip6t_n}" in
+		"eval #"*) ;;
+		*) gen_shunt_chains 6 nat "${redir_port}" | ipt_restore 6 || return 1 ;;
+	esac
+	case "${ip6t_m}" in
+		"eval #"*) ;;
+		*) gen_shunt_chains 6 mangle "${redir_port}" | ipt_restore 6 || return 1 ;;
+	esac
+}
+
+shunt_ready() {
+	$ipt_n -n -L PSW2_SHUNT_NAT >/dev/null 2>&1 && $ipt_m -n -L PSW2_SHUNT_MARK >/dev/null 2>&1 || return 2
+}
+
+# 热切换全局节点：只替换分流子链并补充新节点地址白名单；主链、DNS 劫持及其它规则保持不变。
+shunt_switch() {
+	local node=${1}
+	local redir_port=${2}
+	[ -n "${node}" ] && [ -n "${redir_port}" ] || return 1
+	[ -z "$(command -v log_i18n)" ] && . "$UTILS_PATH"
+	shunt_ready || return 2
+	SHUNT_PRESERVE_SETS=1
+	gen_shunt_list "${node}" SHUNT_LIST4 SHUNT_LIST6
+	unset SHUNT_PRESERVE_SETS
+	apply_shunt_chains "${redir_port}" || return 1
+	filter_vps_addr $(config_n_get ${node} address) $(config_n_get ${node} download_address) >/dev/null 2>&1 &
+	gen_include
+}
+
+# 规则数据或分流规则内容更新后的热刷新：由规则派生的集合写入临时集合后逐个 ipset swap，再原子替换默认实例的分流子链。
+# 直连写集合按上游 flush_set 语义清空；独立访问控制实例只刷新集合内容（配置指纹保证集合名不变）。
+refresh_sets() {
+	local node=${1}
+	local redir_port=${2}
+	local flush=${3}
+	[ -z "$(command -v log_i18n)" ] && . "$UTILS_PATH"
+	shunt_ready || return 2
+	[ "${flush}" = "1" ] && rm -rf "$TMP_PATH2/geo_output"
+	if [ -z "${ISP_DNS}${ISP_DNS6}" ]; then
+		local resolv=/tmp/resolv.conf.d/resolv.conf.auto
+		[ -s "${resolv}" ] || resolv=/tmp/resolv.conf.auto
+		ISP_DNS=$(cat $resolv 2>/dev/null | grep -E -o "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | grep -v -E '^(0\.0\.0\.0|127\.0\.0\.1)$' | awk '!seen[$0]++')
+		ISP_DNS6=$(cat $resolv 2>/dev/null | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | awk -F % '{print $1}' | awk -F " " '{print $2}' | grep -v -Fx ::1 | grep -v -Fx :: | awk '!seen[$0]++')
+	fi
+	local var_file acl_use acl_node done_nodes=" " tmp real status=0
+	IPSET_REFRESH="$TMP_PATH/refresh_sets.ipset"
+	: > "${IPSET_REFRESH}"
+	fill_direct_sets $(refresh_set $IPSET_DIRECT nethash maxelem 1048576) $(refresh_set $IPSET_DIRECT6 nethash family inet6 maxelem 1048576)
+	for var_file in "${TMP_ACL_PATH}"/*/var; do
+		[ -s "${var_file}" ] || continue
+		acl_use=$(sed -n 's/^use="\(.*\)"$/\1/p' "${var_file}" | tail -n 1)
+		acl_node=$(sed -n 's/^node="\(.*\)"$/\1/p' "${var_file}" | tail -n 1)
+		[ "${acl_use}" = "acl_default" ] || [ -z "${acl_node}" ] && continue
+		case "${done_nodes}" in *" ${acl_node} "*) continue ;; esac
+		done_nodes="${done_nodes}${acl_node} "
+		[ "${acl_node}" = "${node}" ] && continue
+		gen_shunt_list "${acl_node}" _refresh_list4 _refresh_list6
+	done
+	unset SHUNT_LIST4 SHUNT_LIST6
+	[ -n "${node}" ] && gen_shunt_list "${node}" SHUNT_LIST4 SHUNT_LIST6
+	while read -r tmp real; do
+		ipset swap ${tmp} ${real} && ipset destroy ${tmp} || status=1
+	done < "${IPSET_REFRESH}"
+	unset IPSET_REFRESH
+	[ "${status}" = 0 ] || return 1
+	apply_shunt_chains "${redir_port}" || return 1
+	gen_include
+}
+
 load_acl() {
-	log_i18n 1 "Access Control:"
-	acl_node
+	[ -n "${ACL_NODE_DONE}" ] || {
+		log_i18n 1 "Access Control:"
+		acl_node
+	}
 	for sid in $(jsonfilter -s "${ACL_JSON}" -e '$.acl[*].flag'); do
 		eval local $(cat "${TMP_ACL_PATH}/${sid}/var")
 
-		[ -z "$(get_cache_var "node_${node}_gen_shunt_list")" ] && [ -n "${node}" ] && gen_shunt_list "${node}" shunt_list4 shunt_list6
+		# 使用默认实例的条目跳转到共享分流子链；独立实例按各自节点生成静态规则（同一节点的集合只载入一次）。
+		# 上游按“节点是否已生成过列表”跳过计算，列表变量会沿用上一条目的值。
+		unset shunt_list4 shunt_list6
+		if [ "${use}" = "acl_default" ]; then
+			shunt_list4="@global"
+			shunt_list6="@global"
+		elif [ -n "${node}" ]; then
+			SHUNT_PRESERVE_SETS=1
+			gen_shunt_list "${node}" shunt_list4 shunt_list6
+			unset SHUNT_PRESERVE_SETS
+		fi
 		[ -n "${use}" ] && local dns_redirect_port=$(get_cache_var "ACL_${use}_dns_port")
 
 		local ipt_tmp=$ipt_n
@@ -624,6 +871,66 @@ filter_direct_node_list() {
 	done
 }
 
+# 直连集合的内容：direct_ip（含 geoip 代码）、LAN 网段与 ISP DNS。参数为目标集合（热刷新时是临时集合）。
+fill_direct_sets() {
+	local set4=${1}
+	local set6=${2}
+	for ip in $(cat /usr/share/passwall2/direct_ip | tr -s "\r\n" "\n" | grep -v "^#" | sed -e "/^$/d"); do
+		if [[ "$ip" == *::* ]]; then
+			ipset -! add $set6 $ip
+		elif [[ "$ip" == "geoip:"* ]]; then
+			local _geoip_code=$(echo $ip | awk -F ':' '{print $2}')
+			get_geoip $_geoip_code ipv4 | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $set4 &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
+			get_geoip $_geoip_code ipv6 | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $set6 &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
+		else
+			ipset -! add $set4 $ip
+		fi
+	done
+
+	# Ignore special IP ranges
+	local lan_ifname lan_ip
+	lan_ifname=$(uci -q -p /tmp/state get network.lan.ifname)
+	[ -n "$lan_ifname" ] && {
+		lan_ip=$(ip address show $lan_ifname | grep -w "inet" | awk '{print $2}')
+		lan_ip6=$(ip address show $lan_ifname | grep -w "inet6" | awk '{print $2}')
+		#log_i18n 1 "local network segments (%s) direct connection: %s" "IPv4" "${lan_ip}"
+		#log_i18n 1 "local network segments (%s) direct connection: %s" "IPv6" "${lan_ip6}"
+
+		[ -n "$lan_ip" ] && ipset -! -R <<-EOF
+			$(echo $lan_ip | sed -e "s/ /\n/g" | sed -e "s/^/add $set4 /")
+		EOF
+
+		[ -n "$lan_ip6" ] && ipset -! -R <<-EOF
+			$(echo $lan_ip6 | sed -e "s/ /\n/g" | sed -e "s/^/add $set6 /")
+		EOF
+	}
+
+	[ -n "$ISP_DNS" ] && {
+		for ispip in $ISP_DNS; do
+			ipset -! add $set4 $ispip
+			[ -z "${IPSET_REFRESH}" ] && log_i18n 1 "$(i18n "Add ISP %s DNS to the whitelist: %s" "IPv4" "${ispip}")"
+		done
+	}
+
+	[ -n "$ISP_DNS6" ] && {
+		for ispip6 in $ISP_DNS6; do
+			ipset -! add $set6 $ispip6
+			[ -z "${IPSET_REFRESH}" ] && log_i18n 1 "$(i18n "Add ISP %s DNS to the whitelist: %s" "IPv6" "${ispip6}")"
+		done
+	}
+	return 0
+}
+
+filter_vps_addr() {
+	local server_host ip
+	for server_host in "$@"; do
+		ip=$(get_host_ip "ipv4" ${server_host})
+		[ -n "$ip" ] && ipset -q add $IPSET_VPS $ip
+		ip=$(get_host_ip "ipv6" ${server_host})
+		[ -n "$ip" ] && ipset -q add $IPSET_VPS6 $ip
+	done
+}
+
 update_wan_sets() {
 	[ -z "$(command -v get_wan_ips)" ] && . "$UTILS_PATH"
 
@@ -664,55 +971,15 @@ add_firewall_rule() {
 	get_local_ips ip4 | sed "s/^/add $IPSET_LOCAL /" | ipset -! -R
 	get_local_ips ip6 | sed "s/^/add $IPSET_LOCAL6 /" | ipset -! -R
 
-	for ip in $(cat /usr/share/passwall2/direct_ip | tr -s "\r\n" "\n" | grep -v "^#" | sed -e "/^$/d"); do
-		if [[ "$ip" == *::* ]]; then
-			ipset -! add $IPSET_DIRECT6 $ip
-		elif [[ "$ip" == "geoip:"* ]]; then
-			local _geoip_code=$(echo $ip | awk -F ':' '{print $2}')
-			get_geoip $_geoip_code ipv4 | grep -E "(\.((2(5[0-5]|[0-4][0-9]))|[0-1]?[0-9]{1,2})){3}" | sed -e "s/^/add $IPSET_DIRECT &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
-			get_geoip $_geoip_code ipv6 | grep -E "([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4}" | sed -e "s/^/add $IPSET_DIRECT6 &/g" | awk '{print $0} END{print "COMMIT"}' | ipset -! -R
-		else
-			ipset -! add $IPSET_DIRECT $ip
-		fi
-	done
-
-	# Ignore special IP ranges
-	local lan_ifname lan_ip
-	lan_ifname=$(uci -q -p /tmp/state get network.lan.ifname)
-	[ -n "$lan_ifname" ] && {
-		lan_ip=$(ip address show $lan_ifname | grep -w "inet" | awk '{print $2}')
-		lan_ip6=$(ip address show $lan_ifname | grep -w "inet6" | awk '{print $2}')
-		#log_i18n 1 "local network segments (%s) direct connection: %s" "IPv4" "${lan_ip}"
-		#log_i18n 1 "local network segments (%s) direct connection: %s" "IPv6" "${lan_ip6}"
-
-		[ -n "$lan_ip" ] && ipset -! -R <<-EOF
-			$(echo $lan_ip | sed -e "s/ /\n/g" | sed -e "s/^/add $IPSET_DIRECT /")
-		EOF
-
-		[ -n "$lan_ip6" ] && ipset -! -R <<-EOF
-			$(echo $lan_ip6 | sed -e "s/ /\n/g" | sed -e "s/^/add $IPSET_DIRECT6 /")
-		EOF
-	}
-
+	fill_direct_sets $IPSET_DIRECT $IPSET_DIRECT6
 	update_wan_sets
 
-	[ -n "$ISP_DNS" ] && {
-		for ispip in $ISP_DNS; do
-			ipset -! add $IPSET_DIRECT $ispip
-			log_i18n 1 "$(i18n "Add ISP %s DNS to the whitelist: %s" "IPv4" "${ispip}")"
-		done
-	}
-
-	[ -n "$ISP_DNS6" ] && {
-		for ispip6 in $ISP_DNS6; do
-			ipset -! add $IPSET_DIRECT6 $ispip6
-			log_i18n 1 "$(i18n "Add ISP %s DNS to the whitelist: %s" "IPv6" "${ispip6}")"
-		done
-	}
-
 	# Filter all node IPs
-	filter_vpsip > /dev/null 2>&1 &
-	filter_haproxy > /dev/null 2>&1 &
+	# psw2_vps 只增不减（前置 DNS 也会写入）：影子启动不生成，提交后在系统中照常补充。
+	[ -z "${PW2_STAGE}" ] && {
+		filter_vpsip > /dev/null 2>&1 &
+		filter_haproxy > /dev/null 2>&1 &
+	}
 
 	accept_icmp=$(config_n_get @global_forwarding[0] accept_icmp 0)
 	accept_icmpv6=$(config_n_get @global_forwarding[0] accept_icmpv6 0)
@@ -772,8 +1039,10 @@ add_firewall_rule() {
 	$ipt_m -A PSW2_OUTPUT -m conntrack --ctdir REPLY -j RETURN
 	$ipt_m -A PSW2_OUTPUT -m mark --mark 0xff/0xff -j RETURN
 
-	ip rule add fwmark ${FWMARK} table 999 priority 999
-	ip route add local 0.0.0.0/0 dev lo table 999
+	[ -z "${PW2_STAGE}" ] && {
+		ip rule add fwmark ${FWMARK} table 999 priority 999
+		ip route add local 0.0.0.0/0 dev lo table 999
+	}
 
 	[ "$accept_icmpv6" = "1" ] && {
 		$ip6t_n -N PSW2
@@ -831,12 +1100,31 @@ add_firewall_rule() {
 		done
 	}
 
-	ip -6 rule add fwmark ${FWMARK} table 999 priority 999
-	ip -6 route add local ::/0 dev lo table 999
+	[ -z "${PW2_STAGE}" ] && {
+		ip -6 rule add fwmark ${FWMARK} table 999 priority 999
+		ip -6 route add local ::/0 dev lo table 999
+	}
+
+	# 先启动各实例（核心、前置 DNS、直连写集合 DNS）：默认实例的分流子链要包含启动时登记的直连写集合，
+	# 且生成器在分流规则变化时清空集合的动作必须发生在集合填充之前。
+	log_i18n 1 "Access Control:"
+	acl_node
+	ACL_NODE_DONE=1
+
+	# 默认实例的分流子链按全局节点生成；访问控制条目在 load_acl 中跳转到它们。
+	local default_redir_port=$(sed -n 's/^redir_port="\(.*\)"$/\1/p' ${TMP_ACL_PATH}/acl_default/var 2>/dev/null)
+	unset SHUNT_LIST4 SHUNT_LIST6
+	[ -n "${NODE}" ] && gen_shunt_list "${NODE}" SHUNT_LIST4 SHUNT_LIST6
+	apply_shunt_chains "${default_redir_port}"
 
 	load_acl
 
-	filter_direct_node_list > /dev/null 2>&1 &
+	# 影子启动同步生成直连节点的放行规则，使目标规则完整。
+	if [ -n "${PW2_STAGE}" ]; then
+		filter_direct_node_list > /dev/null 2>&1
+	else
+		filter_direct_node_list > /dev/null 2>&1 &
+	fi
 
 	[ -z "${IPT_N}" ] && {
 		for chain in "PSW2" "PSW2_OUTPUT"; do
@@ -855,16 +1143,19 @@ add_firewall_rule() {
 }
 
 del_firewall_rule() {
-	for ipt in "$ipt_n" "$ipt_m" "$ip6t_n" "$ip6t_m"; do
+	# 循环变量不能叫 ipt：会覆盖 iptables 路径（gen_include 等仍要用）。
+	local _ipt_cmd
+	for _ipt_cmd in "$ipt_n" "$ipt_m" "$ip6t_n" "$ip6t_m"; do
 		for chain in "PREROUTING" "OUTPUT"; do
-			for i in $(seq 1 $($ipt -nL $chain | grep -c PSW2)); do
-				local index=$($ipt --line-number -nL $chain | grep PSW2 | head -1 | awk '{print $1}')
-				$ipt -D $chain $index 2>/dev/null
+			for i in $(seq 1 $($_ipt_cmd -nL $chain | grep -c PSW2)); do
+				local index=$($_ipt_cmd --line-number -nL $chain | grep PSW2 | head -1 | awk '{print $1}')
+				$_ipt_cmd -D $chain $index 2>/dev/null
 			done
 		done
-		for chain in "PSW2" "PSW2_OUTPUT" "PSW2_DNS" "PSW2_RULE"; do
-			$ipt -F $chain 2>/dev/null
-			$ipt -X $chain 2>/dev/null
+		# 先删引用分流子链的主链，再删分流子链与辅助链，最后删被分流子链引用的 PSW2_RULE。
+		for chain in "PSW2" "PSW2_OUTPUT" "PSW2_DNS" ${SHUNT_CHAINS} ${SHUNT_HELPER_CHAINS} "PSW2_RULE"; do
+			$_ipt_cmd -F $chain 2>/dev/null
+			$_ipt_cmd -X $chain 2>/dev/null
 		done
 	done
 
@@ -889,6 +1180,15 @@ flush_include() {
 }
 
 gen_include() {
+	# 独立调用（热切换全局节点、集合热刷新、差量热重载之后）时没有启动阶段的变量：按当前配置补齐，
+	# 否则恢复脚本会按重定向模式恢复 TCP 跳转、漏掉 ICMP 跳转。
+	[ -z "$(command -v config_n_get)" ] && . "$UTILS_PATH"
+	[ -n "${TCP_PROXY_WAY}" ] || {
+		TCP_PROXY_WAY=$(config_n_get @global_forwarding[0] tcp_proxy_way redirect)
+		[ "${TCP_PROXY_WAY}" = "tproxy" ] && is_tproxy="TPROXY"
+	}
+	[ -n "${accept_icmp}" ] || accept_icmp=$(config_n_get @global_forwarding[0] accept_icmp 0)
+	[ -n "${accept_icmpv6}" ] || accept_icmpv6=$(config_n_get @global_forwarding[0] accept_icmpv6 0)
 	flush_include
 	extract_rules() {
 		local _ipt="${ipt}"
@@ -926,7 +1226,7 @@ gen_include() {
 			$(extract_rules 6 mangle)
 			EOT
 
-			[ "$accept_icmpv6" = "1" ] && $ip6t_n -A PREROUTING $(dst $IPSET_DIRECT6 !) -p ipv6-icmp -j PSW2
+			[ "$accept_icmpv6" = "1" ] && $ip6t -t nat -w -A PREROUTING $(dst $IPSET_DIRECT6 !) -p ipv6-icmp -j PSW2
 
 			\$(${MY_PATH} insert_rule_before "$ip6t_m" "PREROUTING" "mwan3" "$(dst $IPSET_DIRECT6 !) -j PSW2")
 		EOF
@@ -952,8 +1252,9 @@ get_ip6t_bin() {
 
 start() {
 	[ "$ENABLED_DEFAULT_ACL" == 0 -a "$ENABLED_ACLS" == 0 ] && return
+	[ -z "${PW2_STAGE}" ] && : > "${IPT_LOG}"
 	add_firewall_rule
-	gen_include
+	[ -z "${PW2_STAGE}" ] && gen_include
 }
 
 stop() {
@@ -988,7 +1289,39 @@ get_ip6t_bin)
 	get_ip6t_bin
 	;;
 filter_direct_node_list)
+	[ -z "$(command -v config_n_get)" ] && . "$UTILS_PATH"
+	# 直接调用（热重载、Socks 节点切换）时没有启动阶段的变量：按当前 TCP 转发方式决定 TCP 规则所在的表。
+	[ "$(config_n_get @global_forwarding[0] tcp_proxy_way redirect)" = "tproxy" ] && is_tproxy="TPROXY"
 	filter_direct_node_list
+	;;
+filter_vpsip)
+	[ -z "$(command -v config_n_get)" ] && . "$UTILS_PATH"
+	filter_vpsip
+	;;
+filter_vps_addr)
+	[ -z "$(command -v config_n_get)" ] && . "$UTILS_PATH"
+	filter_vps_addr "$@"
+	;;
+shunt_ready)
+	shunt_ready
+	;;
+shunt_switch)
+	shunt_switch "$@"
+	;;
+refresh_sets)
+	refresh_sets "$@"
+	;;
+post_reconcile)
+	# 差量热重载提交规则之后：重写防火墙重载时的恢复脚本。
+	[ -z "$(command -v log_i18n)" ] && . "$UTILS_PATH"
+	gen_include
+	;;
+clear)
+	# 差量热重载的目标状态不再需要透明代理规则：只删除规则，不处理 flush_set。
+	[ -z "$(command -v log_i18n)" ] && . "$UTILS_PATH"
+	del_firewall_rule
+	flush_include
+	rm -f "${IPT_LOG}"
 	;;
 update_wan_sets)
 	update_wan_sets "$@"

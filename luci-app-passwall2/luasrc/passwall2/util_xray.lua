@@ -82,7 +82,9 @@ function gen_outbound(flag, node, tag, proxy_table)
 					end
 				end
 				if run_socks_instance then
-					new_port = api.get_new_port()
+					-- 桥接端口按节点（及带标签的中继）稳定分配，重新生成的配置与运行中的一致。
+					local bridge = (tag and node_id and not tag:find(node_id)) and (tag .. "_" .. node_id) or node_id
+					new_port = api.get_new_port(nil, "nodesocks:" .. bridge .. ":" .. relay_port)
 					local config_file = string.format("nodesocks_%s_%s.json", node_id, new_port)
 					if tag and node_id and not tag:find(node_id) then
 						config_file = string.format("nodesocks_%s_%s_%s.json", tag, node_id, new_port)
@@ -658,7 +660,9 @@ function gen_config_server(node)
 					finalRules = {{ action = "allow" }}
 				}
 			}
-			sys.call(string.format("mkdir -p %s && touch %s/%s", api.TMP_IFACE_PATH, api.TMP_IFACE_PATH, node.outbound_node_iface))
+			if not RELOAD then
+				sys.call(string.format("mkdir -p %s && touch %s/%s", api.TMP_IFACE_PATH, api.TMP_IFACE_PATH, node.outbound_node_iface))
+			end
 		else
 			local outbound_node_t = api.uci_get_c(node.outbound_node)
 			if node.outbound_node == "_socks" or node.outbound_node == "_http" then
@@ -921,6 +925,7 @@ function gen_config(var)
 	local remote_dns_detour = var["remote_dns_detour"]
 	local dns_cache = var["dns_cache"]
 	NO_RUN = var["no_run"]
+	RELOAD = var["reload"]
 
 	local dns_domain_rules = {}
 	local dns = {}
@@ -933,7 +938,8 @@ function gen_config(var)
  	local strategy = nil
 	local COMMON = {}
 
-	local CACHE_TEXT_FILE = CACHE_PATH .. "/cache_" .. flag .. ".txt"
+	-- 影子启动与暂存的上次记录比较（不改动正式缓存），提交时再写回。
+	local CACHE_TEXT_FILE = (os.getenv("PW2_GEN_CACHE") or CACHE_PATH) .. "/cache_" .. flag .. ".txt"
 
 	local xray_settings = api.uci_get_c("@global_xray[0]") or {}
 
@@ -1248,7 +1254,7 @@ function gen_config(var)
 				local to_outbound
 				if to_node.type ~= "Xray" then
 					local in_tag = "inbound_" .. to_node[".name"] .. "_" .. tostring(outbound.tag)
-					local new_port = api.get_new_port()
+					local new_port = api.get_new_port(nil, "tunnel:" .. flag .. ":" .. in_tag)
 					table.insert(inbounds, {
 						tag = in_tag,
 						listen = "127.0.0.1",
@@ -1341,7 +1347,9 @@ function gen_config(var)
 							finalRules = {{ action = "allow" }}
 						}
 					}
-					sys.call(string.format("mkdir -p %s && touch %s/%s", api.TMP_IFACE_PATH, api.TMP_IFACE_PATH, node.iface))
+					if not RELOAD then
+						sys.call(string.format("mkdir -p %s && touch %s/%s", api.TMP_IFACE_PATH, api.TMP_IFACE_PATH, node.iface))
+					end
 				end
 			end
 			if not outbound then
@@ -1902,7 +1910,18 @@ function gen_config(var)
 		end
 
 		local content = flag .. node_id .. jsonc.stringify(routing.rules)
-		if api.cacheFileCompareToLogic(CACHE_TEXT_FILE, content) == false then
+		local rules_changed = not RELOAD and api.cacheFileCompareToLogic(CACHE_TEXT_FILE, content) == false
+		if rules_changed and os.getenv("PW2_STAGE") then
+			-- 影子启动：分流规则变化后需要清空的直连写集合记录下来，由热重载在防火墙事务中清空。
+			local out = io.open(api.TMP_PATH .. "/flush_sets", "a")
+			if out then
+				string.gsub(direct_nftset or direct_ipset or "", '[^' .. "," .. ']+', function(w)
+					local split = api.split(w, "#")
+					out:write((#split > 3 and split[4] or w) .. "\n")
+				end)
+				out:close()
+			end
+		elseif rules_changed then
 			--clear ipset/nftset
 			if direct_ipset then
 				string.gsub(direct_ipset, '[^' .. "," .. ']+', function(w)
@@ -2085,7 +2104,8 @@ function gen_config(var)
 
 		for index, value in ipairs(config.outbounds) do
 			local s = value.settings
-			if not value["_flag_proxy_tag"] and value["_id"] and s and not NO_RUN and
+			-- 热重载同样记录直连拨号的节点，执行器据此为新的“地址:端口”补充本机放行规则；节点测速等临时实例不记录。
+			if not value["_flag_proxy_tag"] and value["_id"] and s and (not NO_RUN or RELOAD) and not os.getenv("PW2_TEMPORARY") and
 			((s.vnext and s.vnext[1] and s.vnext[1].address and s.vnext[1].port) or 
 			(s.servers and s.servers[1] and s.servers[1].address and s.servers[1].port) or
 			(s.peers and s.peers[1] and s.peers[1].endpoint) or
@@ -2096,6 +2116,24 @@ function gen_config(var)
 				if k:find("_") == 1 then
 					config.outbounds[index][k] = nil
 				end
+			end
+		end
+		-- 原生热重载使用独立的本机 api.listen，避免把控制连接本身转发到新的数据运行实例；
+		-- 不支持原生重载的核心退回 dokodemo 入站加路由规则的旧式写法。
+		if var.reload_api_port then
+			config.api = { tag = "psw2-reload-api", services = {"HandlerService", "RoutingService"} }
+			if var.reload_native == "1" then
+				config.api.listen = "127.0.0.1:" .. var.reload_api_port
+			else
+				config.inbounds = config.inbounds or {}
+				table.insert(config.inbounds, {
+					tag = "psw2-reload-api-in", listen = "127.0.0.1", port = tonumber(var.reload_api_port),
+					protocol = "dokodemo-door", settings = {address = "127.0.0.1"}
+				})
+				config.routing = config.routing or { rules = {} }
+				table.insert(config.routing.rules, 1, {
+					ruleTag = "psw2-reload-api", inboundTag = {"psw2-reload-api-in"}, outboundTag = "psw2-reload-api"
+				})
 			end
 		end
 		return jsonc.stringify(config, 1)

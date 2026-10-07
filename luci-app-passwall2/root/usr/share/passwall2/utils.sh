@@ -4,10 +4,12 @@
 
 CONFIG=passwall2
 APP_PATH=/usr/share/${CONFIG}
-TMP_PATH=/tmp/etc/${CONFIG}
-TMP_PATH2=${TMP_PATH}_tmp
+# 影子启动（热重载生成目标状态，见 app.sh stage）用 PW2_TMP_PATH 把生成的文件写到暂存目录、PW2_LOG_FILE 写暂存日志；
+# 缓存目录（规则集、geoip 解析结果、FakeIP 缓存库）始终使用正式路径，生成的配置因此可以原样投入使用。
+TMP_PATH=${PW2_TMP_PATH:-/tmp/etc/${CONFIG}}
+TMP_PATH2=/tmp/etc/${CONFIG}_tmp
 LOCK_PATH=/var/lock
-LOG_FILE=/tmp/log/${CONFIG}.log
+LOG_FILE=${PW2_LOG_FILE:-/tmp/log/${CONFIG}.log}
 TMP_ACL_PATH=${TMP_PATH}/acl
 TMP_BIN_PATH=${TMP_PATH}/bin
 TMP_IFACE_PATH=${TMP_PATH}/iface
@@ -277,12 +279,67 @@ check_port_exists() {
 	echo "${result}"
 }
 
+# 影子启动模式：完整执行一遍启动流程，但只生成目标状态（进程排队不启动，防火墙规则写入影子表，系统设置不变）。
+staging() {
+	[ -n "${PW2_STAGE}" ]
+}
+
+# 稳定分配：端口与 secret 按用途（键）记录在 $TMP_PATH/stable（每行“键 值”），重新生成时沿用，
+# 未变化的服务生成的配置与运行中的逐字节一致。影子启动时 PW2_STABLE_HINT 指向运行中的记录，
+# PW2_STABLE_FRESH 中的键（需要蓝绿替换的服务）不沿用旧值。临时实例（PW2_TEMPORARY，见 app.sh run_socks）
+# 不读写记录，按用途键分配退化为普通分配（仍避开已记录的端口）。
+stable_lookup() {
+	[ -n "$2" ] && [ -s "$2" ] && awk -v k="$1" '$1 == k { v = $2 } END { if (v != "") print v }' "$2"
+}
+
+stable_get() {
+	[ -n "${PW2_TEMPORARY}" ] && return 0
+	local key="$1" value
+	value=$(stable_lookup "${key}" "$TMP_PATH/stable")
+	[ -z "${value}" ] && [ -n "${PW2_STABLE_HINT}" ] && case " ${PW2_STABLE_FRESH} " in
+		*" ${key} "*) ;;
+		*) value=$(stable_lookup "${key}" "${PW2_STABLE_HINT}") ;;
+	esac
+	[ -n "${value}" ] && echo "${value}"
+}
+
+stable_set() {
+	[ -n "${PW2_TEMPORARY}" ] && return 0
+	[ -n "$1" ] && [ -n "$2" ] || return 1
+	[ ! -d $TMP_PATH ] && mkdir -p $TMP_PATH
+	(umask 077; touch "$TMP_PATH/stable")
+	sed -i "/^$1 /d" "$TMP_PATH/stable"
+	echo "$1 $2" >> "$TMP_PATH/stable"
+}
+
+# 端口是否已记录为某个用途的稳定端口（本次或运行中的记录）；新分配时跳过，避免与沿用的端口冲突。
+stable_port_taken() {
+	local file
+	for file in "$TMP_PATH/stable" "${PW2_STABLE_HINT}"; do
+		[ -n "${file}" ] && [ -s "${file}" ] && awk -v p="$1" '$2 == p { found = 1 } END { exit !found }' "${file}" && return 0
+	done
+	return 1
+}
+
 get_new_port() {
 	local default_start_port=2001
 	local min_port=1025
 	local max_port=49151
 	local port=$1 #Required parameter; please pass "auto" if you want it to be automatic.
+	local key=$3 # 可选：用途键，同一用途沿用已记录的端口（见 stable_get）。
 	local last_get_new_port_auto
+	if [ -n "${key}" ]; then
+		local stable=$(stable_get "${key}")
+		if [ -n "${stable}" ]; then
+			set_cache_var "get_port_${stable}" "1"
+			stable_set "${key}" "${stable}"
+		else
+			stable=$(get_new_port "$1" "$2")
+			stable_set "${key}" "${stable}"
+		fi
+		echo ${stable}
+		return
+	fi
 	if [ "$1" == "auto" ]; then
 		last_get_new_port_auto=$(get_cache_var "last_get_new_port_auto")
 		if [ -n "$last_get_new_port_auto" ]; then
@@ -300,6 +357,7 @@ get_new_port() {
 		# Make the following result logic true.
 		result=1
 	}
+	stable_port_taken "${port}" && result=1
 	if [ "$result" != 0 ]; then
 		local temp=
 		if [ "$port" -lt $max_port ]; then
@@ -348,7 +406,12 @@ add_ip2route() {
 	[ -z "${device}" ] && device="$2"
 
 	if [ -n "${gateway}" ]; then
-		route add -host ${ip} gw ${gateway} dev ${device} >/dev/null 2>&1
+		# 影子启动只记录，由热重载提交时按差异增删路由。
+		if staging; then
+			echo "$1 $2" >> $TMP_PATH/routes.add
+		else
+			route add -host ${ip} gw ${gateway} dev ${device} >/dev/null 2>&1
+		fi
 		echo "$ip" >> $TMP_ROUTE_PATH/${device}
 		log 1 "$(i18n "[%s] was successfully added to the routing table of interface [%s]!" "${remarks}" "${device}")"
 	else
@@ -386,6 +449,8 @@ ln_run() {
 		return 1
 	}
 
+	# 影子启动只记录要启动的进程（与排队启动的格式相同），由热重载提交时与运行中的进程比较。
+	staging && queue_run=1
 	[ "${queue_run}" == "1" ] && {
 		mkdir -p $TMP_PROCESS_LIST_PATH
 		process_count=$(ls $TMP_PROCESS_LIST_PATH | grep -v "^_" | wc -l)
